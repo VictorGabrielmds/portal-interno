@@ -10,6 +10,7 @@
     .\instalar.ps1 -Desinstalar
 
   O que faz:
+    - desliga o agente antigo (tarefa "svt_telemetria"), se existir;
     - copia o svt-monitor.ps1 para C:\ProgramData\SVT-Monitor (baixa do portal se nao estiver ao lado);
     - grava o config.json (url, token, coletor, redes) so com acesso de SYSTEM e Administradores;
     - cria a tarefa agendada "SVT Monitor": como SYSTEM, ao ligar e a cada 5 minutos;
@@ -48,6 +49,17 @@ if (-not $Token) {
   exit 1
 }
 
+# Agente antigo (tarefa "svt_telemetria", que roda C:\SVT\agente_svt.ps1 sem parar): desliga, senao o
+# computador continua gravando tambem pelo caminho velho. O arquivo em C:\SVT fica onde esta.
+$antigas = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
+  $_.TaskName -eq 'svt_telemetria' -or (@($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -match 'agente_svt\.ps1')
+})
+foreach ($antiga in $antigas) {
+  Stop-ScheduledTask -TaskName $antiga.TaskName -TaskPath $antiga.TaskPath -ErrorAction SilentlyContinue
+  Unregister-ScheduledTask -TaskName $antiga.TaskName -TaskPath $antiga.TaskPath -Confirm:$false -ErrorAction SilentlyContinue
+  Write-Host "Agente antigo desligado (tarefa $($antiga.TaskName))." -ForegroundColor Cyan
+}
+
 New-Item -ItemType Directory -Force -Path $PASTA | Out-Null
 $destino = Join-Path $PASTA 'svt-monitor.ps1'
 $aoLado = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'svt-monitor.ps1' } else { '' }
@@ -69,8 +81,9 @@ $arquivoConfig = Join-Path $PASTA 'config.json'
 try {
   $acl = New-Object System.Security.AccessControl.FileSecurity
   $acl.SetAccessRuleProtection($true, $false)
-  foreach ($conta in @('NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators')) {
-    $sid = (New-Object System.Security.Principal.NTAccount($conta)).Translate([System.Security.Principal.SecurityIdentifier])
+  # Pelo SID, e nao pelo nome: no Windows em portugues as contas se chamam "SISTEMA" e "Administradores".
+  foreach ($conta in @('S-1-5-18', 'S-1-5-32-544')) {
+    $sid = New-Object System.Security.Principal.SecurityIdentifier($conta)
     $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'Allow')))
   }
   Set-Acl -Path $arquivoConfig -AclObject $acl

@@ -23,7 +23,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$VERSAO = '2.0.0'
+$VERSAO = '2.0.1'
 # $PSScriptRoot fica vazio nos valores padrao do param() do PowerShell 5.1.
 $PASTA = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if (-not $Config) { $Config = Join-Path $PASTA 'config.json' }
@@ -63,8 +63,12 @@ function Ler-Config {
 function Medir-Pings([string[]]$Ips, [int]$TimeoutMs = 800) {
   # Ping em paralelo; devolve @{ ip = milissegundos } so de quem respondeu.
   $resultado = @{}
-  if (-not $Ips) { return $resultado }
-  foreach ($lote in (Dividir-Lista $Ips 256)) {
+  $Ips = @($Ips)
+  if (-not $Ips.Count) { return $resultado }
+  # Lotes por indice: devolver os lotes de uma funcao faz o PowerShell desmontar o lote unico
+  # (ate 256 enderecos) em itens soltos, e o ping vira um por vez.
+  for ($i = 0; $i -lt $Ips.Count; $i += 256) {
+    $lote = @($Ips[$i..([math]::Min($i + 256, $Ips.Count) - 1)])
     $pendentes = @()
     foreach ($ip in $lote) {
       $ping = New-Object System.Net.NetworkInformation.Ping
@@ -79,13 +83,6 @@ function Medir-Pings([string[]]$Ips, [int]$TimeoutMs = 800) {
     }
   }
   return $resultado
-}
-
-function Dividir-Lista($Itens, [int]$Tamanho) {
-  $itens = @($Itens)
-  for ($i = 0; $i -lt $itens.Count; $i += $Tamanho) {
-    , ($itens[$i..([math]::Min($i + $Tamanho, $itens.Count) - 1)])
-  }
 }
 
 function Medir-Latencia([string]$Destino, [int]$Vezes = 4) {
@@ -112,10 +109,11 @@ function Testar-Dns {
 function Testar-Portas([string[]]$Ips, [int[]]$Portas, [int]$TimeoutMs = 800) {
   # Conexao TCP em paralelo; devolve @{ ip = @(portas abertas) }.
   $abertas = @{}
-  $pares = foreach ($ip in $Ips) { foreach ($porta in $Portas) { [pscustomobject]@{ Ip = $ip; Porta = $porta } } }
-  foreach ($lote in (Dividir-Lista @($pares) 400)) {
+  $pares = @(foreach ($ip in $Ips) { foreach ($porta in $Portas) { [pscustomobject]@{ Ip = $ip; Porta = $porta } } })
+  for ($i = 0; $i -lt $pares.Count; $i += 400) {
+    $lote = @($pares[$i..([math]::Min($i + 400, $pares.Count) - 1)])
     $tentativas = @()
-    foreach ($par in @($lote)) {
+    foreach ($par in $lote) {
       if (-not $par) { continue }
       $cliente = New-Object System.Net.Sockets.TcpClient
       $tentativas += [pscustomobject]@{ Ip = $par.Ip; Porta = $par.Porta; Cliente = $cliente; Tarefa = $cliente.ConnectAsync($par.Ip, $par.Porta) }
@@ -368,6 +366,7 @@ $OID = @{
   sysLocation  = '.1.3.6.1.2.1.1.6.0'
   modelo       = '.1.3.6.1.2.1.25.3.2.1.3.1'
   statusImp    = '.1.3.6.1.2.1.25.3.5.1.1.1'
+  statusDisp   = '.1.3.6.1.2.1.25.3.2.1.5.1'
   errosImp     = '.1.3.6.1.2.1.25.3.5.1.2.1'
   paginas      = '.1.3.6.1.2.1.43.10.2.1.4.1.1'
   serie        = '.1.3.6.1.2.1.43.5.1.1.17.1'
@@ -386,19 +385,26 @@ $ERROS_IMPRESSORA = @(
   @{ byte = 1; bit = 0x04; codigo = 'bandeja_vazia' }
 )
 
-function Abrir-Snmp([string]$Ip, [string]$Comunidade) {
+function Abrir-Snmp([string]$Ip, [string]$Comunidade, [int]$Tentativas) {
   try {
     $snmp = New-Object -ComObject olePrn.OleSNMP
-    $snmp.Open($Ip, $Comunidade, 1, 1000)
+    $snmp.Open($Ip, $Comunidade, $Tentativas, 1000)
     return $snmp
   } catch { return $null }
 }
 function Ler-Oid($Snmp, [string]$Oid) {
   try { return $Snmp.Get($Oid) } catch { return $null }
 }
+function Numero-Snmp($Valor) {
+  # Resposta vazia (a impressora demorou) nao pode virar 0: seria um falso "toner acabando".
+  if ($null -ne $Valor -and [string]$Valor -match '^-?\d+(\.\d+)?$') { return [double]$Valor }
+  return $null
+}
 
 function Ler-Snmp([string]$Ip, [string]$Comunidade, [bool]$Impressora) {
-  $snmp = Abrir-Snmp $Ip $Comunidade
+  # Impressora ganha uma segunda tentativa (os dados dela importam); nos outros aparelhos, quem
+  # tem SNMP responde em menos de 1 s, e cada um sem SNMP custaria o dobro do tempo.
+  $snmp = Abrir-Snmp $Ip $Comunidade $(if ($Impressora) { 1 } else { 0 })
   if (-not $snmp) { return $null }
   try {
     # Sem resposta ao primeiro pedido, o aparelho nao tem SNMP: nao espera pelos outros.
@@ -428,22 +434,28 @@ function Ler-Snmp([string]$Ip, [string]$Comunidade, [bool]$Impressora) {
       for ($n = 1; $n -le 10; $n++) {
         $desc = Ler-Oid $snmp ($OID.supDescricao + $n)
         if ($null -eq $desc -or [string]$desc -eq '') { break }
-        $maximo = Ler-Oid $snmp ($OID.supMaximo + $n)
-        $nivel = Ler-Oid $snmp ($OID.supNivel + $n)
+        $maximo = Numero-Snmp (Ler-Oid $snmp ($OID.supMaximo + $n))
+        $nivel = Numero-Snmp (Ler-Oid $snmp ($OID.supNivel + $n))
         $percentual = $null
-        if (($maximo -as [double]) -gt 0 -and ($nivel -as [double]) -ge 0) { $percentual = [int][math]::Round(100 * [double]$nivel / [double]$maximo) }
+        if ($null -ne $maximo -and $null -ne $nivel -and $maximo -gt 0 -and $nivel -ge 0) { $percentual = [int][math]::Min(100, [math]::Round(100 * $nivel / $maximo)) }
         if ($null -ne $percentual -and $percentual -le 10 -and [string]$desc -match 'toner|cartucho|cartridge|ink|tinta|black|preto|cyan|magenta|yellow|amarelo' -and -not $alertas.Contains('toner_baixo')) { [void]$alertas.Add('toner_baixo') }
-        $suprimentos += [ordered]@{ nome = ([string]$desc).Trim([char]0); percentual = $percentual }
+        # A Xerox manda "Black Toner Cartridge,  Replace with PN ...;SN ...": fica so o nome.
+        $nomeSuprimento = ((([string]$desc).Trim([char]0)) -split '[,;]')[0].Trim()
+        $suprimentos += [ordered]@{ nome = $nomeSuprimento; percentual = $percentual }
       }
       $statusCodigo = Ler-Oid $snmp $OID.statusImp
       $status = switch ([string]$statusCodigo) { '3' { 'ocioso' } '4' { 'imprimindo' } '5' { 'aquecendo' } default { 'desconhecido' } }
+      if ($status -eq 'desconhecido') {
+        # Algumas (Xerox) respondem "outro" aqui; o estado geral do aparelho ainda diz se esta funcionando.
+        $status = switch ([string](Ler-Oid $snmp $OID.statusDisp)) { '2' { 'ocioso' } '5' { 'erro' } default { 'desconhecido' } }
+      }
       if ($alertas | Where-Object { @('sem_papel', 'sem_toner', 'porta_aberta', 'atolada', 'offline') -contains $_ }) { $status = 'erro' }
       $resultado.impressora = [ordered]@{
         modelo      = [string](Ler-Oid $snmp $OID.modelo)
         serie       = [string](Ler-Oid $snmp $OID.serie)
         status      = $status
         alertas     = @($alertas)
-        paginas     = (Ler-Oid $snmp $OID.paginas) -as [double]
+        paginas     = Numero-Snmp (Ler-Oid $snmp $OID.paginas)
         suprimentos = @($suprimentos)
       }
     }
@@ -469,7 +481,12 @@ function Montar-Varredura($Cfg) {
   $alvos = @($redes | ForEach-Object { Ips-DaRede $_ } | Select-Object -Unique | Select-Object -First 1024)
   Escrever-Log ("Varrendo {0} enderecos em {1}" -f $alvos.Count, ($redes -join ', '))
 
-  $pings = Medir-Pings $alvos 800
+  # Com centenas de pings de uma vez, aparelho lento (Wi-Fi) responde depois do prazo. Na segunda
+  # rodada, so para quem ficou calado, o endereco ja esta resolvido e ele responde na hora.
+  $pings = Medir-Pings $alvos 1000
+  $calados = @($alvos | Where-Object { -not $pings.ContainsKey($_) })
+  $segunda = Medir-Pings $calados 1000
+  foreach ($ip in $segunda.Keys) { $pings[$ip] = $segunda[$ip] }
   Start-Sleep -Milliseconds 500
   $vizinhos = @{}
   foreach ($v in @(Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
