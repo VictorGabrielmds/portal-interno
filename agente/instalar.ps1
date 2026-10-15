@@ -1,0 +1,99 @@
+<#
+  Instala (ou atualiza) o agente SVT Monitor neste computador.
+
+  Rode no PowerShell como Administrador. O comando pronto, com o token, fica na tela
+  Infraestrutura do portal (botao "Instalar agente"). Exemplos:
+
+    .\instalar.ps1 -Token SEU_TOKEN
+    .\instalar.ps1 -Token SEU_TOKEN -Coletor                 (computador sempre ligado que varre a rede)
+    .\instalar.ps1 -Token SEU_TOKEN -Coletor -Redes 192.168.0.0/24,192.168.1.0/24
+    .\instalar.ps1 -Desinstalar
+
+  O que faz:
+    - copia o svt-monitor.ps1 para C:\ProgramData\SVT-Monitor (baixa do portal se nao estiver ao lado);
+    - grava o config.json (url, token, coletor, redes) so com acesso de SYSTEM e Administradores;
+    - cria a tarefa agendada "SVT Monitor": como SYSTEM, ao ligar e a cada 5 minutos;
+    - roda uma vez e mostra se o portal recebeu.
+#>
+[CmdletBinding()]
+param(
+  [string]$Token,
+  [string]$Url = 'https://us-central1-portal-interno-svt.cloudfunctions.net/receberTelemetria',
+  [switch]$Coletor,
+  [string[]]$Redes = @(),
+  [string]$Comunidade = 'public',
+  [string]$Origem = 'https://portal.svtfaculdade.edu.br/agente',
+  [switch]$Desinstalar
+)
+
+$ErrorActionPreference = 'Stop'
+$PASTA = Join-Path $env:ProgramData 'SVT-Monitor'
+$TAREFA = 'SVT Monitor'
+
+$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+  Write-Host 'Abra o PowerShell como Administrador e rode de novo.' -ForegroundColor Red
+  exit 1
+}
+
+if ($Desinstalar) {
+  Unregister-ScheduledTask -TaskName $TAREFA -Confirm:$false -ErrorAction SilentlyContinue
+  Remove-Item $PASTA -Recurse -Force -ErrorAction SilentlyContinue
+  Write-Host 'SVT Monitor removido deste computador.' -ForegroundColor Green
+  exit 0
+}
+
+if (-not $Token) {
+  Write-Host 'Informe o token: .\instalar.ps1 -Token SEU_TOKEN (copie da tela Infraestrutura do portal).' -ForegroundColor Red
+  exit 1
+}
+
+New-Item -ItemType Directory -Force -Path $PASTA | Out-Null
+$destino = Join-Path $PASTA 'svt-monitor.ps1'
+$aoLado = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'svt-monitor.ps1' } else { '' }
+if ($aoLado -and (Test-Path $aoLado)) {
+  Copy-Item $aoLado $destino -Force
+} else {
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  Invoke-WebRequest -Uri "$Origem/svt-monitor.ps1" -OutFile $destino -UseBasicParsing
+}
+Unblock-File $destino -ErrorAction SilentlyContinue
+
+# "-Redes a,b" chega como um texto so quando vem de outro processo.
+$listaRedes = @($Redes | ForEach-Object { $_ -split '[,; ]+' } | Where-Object { $_ })
+$config = [ordered]@{ url = $Url; token = $Token; coletor = [bool]$Coletor; redes = $listaRedes; snmpComunidade = $Comunidade }
+$arquivoConfig = Join-Path $PASTA 'config.json'
+[System.IO.File]::WriteAllText($arquivoConfig, ($config | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+
+# O token fica legivel so para o sistema e para administradores.
+try {
+  $acl = New-Object System.Security.AccessControl.FileSecurity
+  $acl.SetAccessRuleProtection($true, $false)
+  foreach ($conta in @('NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators')) {
+    $sid = (New-Object System.Security.Principal.NTAccount($conta)).Translate([System.Security.Principal.SecurityIdentifier])
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'Allow')))
+  }
+  Set-Acl -Path $arquivoConfig -AclObject $acl
+} catch { Write-Host "Aviso: nao consegui restringir o acesso ao config.json ($($_.Exception.Message))." -ForegroundColor Yellow }
+
+$acao = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$destino`""
+$aCada5 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
+$aoLigar = New-ScheduledTaskTrigger -AtStartup
+$conta = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+$ajustes = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 4) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName $TAREFA -Action $acao -Trigger @($aCada5, $aoLigar) -Principal $conta -Settings $ajustes -Description 'Envia ao Portal Interno SVT o estado deste computador (e da rede, se for o coletor).' -Force | Out-Null
+
+Write-Host "Agente instalado em $PASTA. Enviando o primeiro relatorio..." -ForegroundColor Cyan
+Start-ScheduledTask -TaskName $TAREFA
+$limite = (Get-Date).AddMinutes(3)
+do { Start-Sleep -Seconds 3 } while ((Get-ScheduledTask -TaskName $TAREFA).State -eq 'Running' -and (Get-Date) -lt $limite)
+
+$log = Join-Path $PASTA 'svt-monitor.log'
+$ultimas = if (Test-Path $log) { Get-Content $log -Tail 4 } else { @() }
+if ($ultimas -match 'Enviado') {
+  Write-Host 'Pronto: o portal recebeu os dados deste computador.' -ForegroundColor Green
+} else {
+  Write-Host 'O portal ainda nao confirmou. Ultimas linhas do registro:' -ForegroundColor Yellow
+}
+$ultimas | ForEach-Object { Write-Host "  $_" }
+if ($Coletor) { Write-Host 'Este computador tambem varre a rede (coletor). Deixe-o sempre ligado.' -ForegroundColor Cyan }
