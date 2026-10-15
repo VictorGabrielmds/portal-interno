@@ -23,7 +23,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$VERSAO = '2.0.1'
+$VERSAO = '2.1.0'
 # $PSScriptRoot fica vazio nos valores padrao do param() do PowerShell 5.1.
 $PASTA = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if (-not $Config) { $Config = Join-Path $PASTA 'config.json' }
@@ -204,10 +204,76 @@ function Ler-Wifi {
     sinal  = if ($sinal -match '(\d+)') { [int]$Matches[1] } else { $null }
     canal  = if ((& $valor '(Canal|Channel)') -match '(\d+)') { [int]$Matches[1] } else { $null }
     banda  = (& $valor '(Banda|Band)')
-    radio  = (& $valor '(Tipo de r.dio|Radio type)')
+    radio  = (& $valor '(Tipo de r.{1,3}dio|Radio type)')
     rxMbps = if ($rx -match '([\d.,]+)') { [double]($Matches[1] -replace ',', '.') } else { $null }
     txMbps = if ($tx -match '([\d.,]+)') { [double]($Matches[1] -replace ',', '.') } else { $null }
   }
+}
+
+# Pede ao Windows uma busca nova de redes Wi-Fi (a lista guardada pode estar velha ou incompleta).
+# Usa a API do Windows (wlanapi.dll); se nao der, fica a lista guardada.
+$WLAN_CS = @'
+using System;
+using System.Runtime.InteropServices;
+public static class SvtWlan {
+  [DllImport("wlanapi.dll")] static extern int WlanOpenHandle(uint versao, IntPtr r, out uint negociada, out IntPtr h);
+  [DllImport("wlanapi.dll")] static extern int WlanEnumInterfaces(IntPtr h, IntPtr r, out IntPtr lista);
+  [DllImport("wlanapi.dll")] static extern int WlanScan(IntPtr h, ref Guid g, IntPtr ssid, IntPtr ie, IntPtr r);
+  [DllImport("wlanapi.dll")] static extern void WlanFreeMemory(IntPtr p);
+  [DllImport("wlanapi.dll")] static extern int WlanCloseHandle(IntPtr h, IntPtr r);
+  public static int Buscar() {
+    uint negociada; IntPtr h;
+    if (WlanOpenHandle(2, IntPtr.Zero, out negociada, out h) != 0) return 0;
+    int pedidos = 0;
+    try {
+      IntPtr lista;
+      if (WlanEnumInterfaces(h, IntPtr.Zero, out lista) != 0) return 0;
+      try {
+        int total = Marshal.ReadInt32(lista);
+        for (int i = 0; i < total; i++) {
+          // WLAN_INTERFACE_INFO: GUID (16) + descricao WCHAR[256] (512) + estado (4) = 532 bytes, depois de 8 bytes de cabecalho
+          Guid g = (Guid)Marshal.PtrToStructure(new IntPtr(lista.ToInt64() + 8 + i * 532), typeof(Guid));
+          if (WlanScan(h, ref g, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero) == 0) pedidos++;
+        }
+      } finally { WlanFreeMemory(lista); }
+    } finally { WlanCloseHandle(h, IntPtr.Zero); }
+    return pedidos;
+  }
+}
+'@
+
+function Buscar-RedesWifi {
+  try {
+    if (-not ('SvtWlan' -as [type])) { Add-Type -TypeDefinition $WLAN_CS -ErrorAction Stop }
+    if ([SvtWlan]::Buscar() -gt 0) { Start-Sleep -Seconds 4 }
+  } catch { Escrever-Log "Busca de redes Wi-Fi nao disponivel: $($_.Exception.Message)" }
+}
+
+function Ler-RedesWifi {
+  # Todos os APs que este computador enxerga (das redes da SVT e dos vizinhos): canal, sinal e, quando o
+  # AP informa, quantos aparelhos estao conectados e quanto do canal esta ocupado.
+  $saida = @()
+  try { $saida = @(netsh wlan show networks mode=bssid 2>$null) } catch { return @() }
+  $redes = New-Object System.Collections.ArrayList
+  $ssid = ''
+  $atual = $null
+  foreach ($linha in $saida) {
+    if ($linha -match '^SSID \d+\s*:\s?(?<v>.*)$') { $ssid = $Matches['v'].Trim(); $atual = $null; continue }
+    if ($linha -match '^\s+BSSID \d+\s*:\s*(?<v>\S+)') {
+      if ($redes.Count -ge 80) { break }
+      $atual = [ordered]@{ ssid = $ssid; bssid = $Matches['v']; sinal = $null; canal = $null; banda = ''; radio = ''; estacoes = $null; usoCanal = $null }
+      [void]$redes.Add($atual)
+      continue
+    }
+    if (-not $atual) { continue }
+    if ($linha -match '^\s*(?:Sinal|Signal)\s*:\s*(?<v>\d+)') { $atual.sinal = [int]$Matches['v'] }
+    elseif ($linha -match '^\s*(?:Canal|Channel)\s*:\s*(?<v>\d+)') { $atual.canal = [int]$Matches['v'] }
+    elseif ($linha -match '^\s*(?:Banda|Band)\s*:\s*(?<v>.+?)\s*$') { $atual.banda = $Matches['v'] }
+    elseif ($linha -match '^\s*(?:Tipo de r.{1,3}dio|Radio type)\s*:\s*(?<v>.+?)\s*$') { $atual.radio = $Matches['v'] }
+    elseif ($linha -match '(?:Esta.{1,4}es Conectadas|Connected Stations)\s*:\s*(?<v>\d+)') { $atual.estacoes = [int]$Matches['v'] }
+    elseif ($linha -match '(?:Utiliza.{1,4}o do canal|Channel Utilization)\s*:\s*\d+\s*\((?<v>\d+)\s*%\)') { $atual.usoCanal = [int]$Matches['v'] }
+  }
+  return $redes
 }
 
 function Ler-Adaptadores {
@@ -281,6 +347,18 @@ function Ler-Antivirus {
 }
 
 function Montar-RelatorioPc {
+  # Wi-Fi: so em computador com placa de Wi-Fi ligada.
+  $wifi = Ler-Wifi
+  $visiveis = @()
+  if (Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -ne 'Disabled' -and ($_.NdisPhysicalMedium -eq 9 -or $_.PhysicalMediaType -match '802\.11|Wireless' -or $_.InterfaceDescription -match 'Wi-?Fi|Wireless|WLAN|802\.11') }) {
+    Buscar-RedesWifi
+    $visiveis = @(Ler-RedesWifi)
+    if ($wifi) {
+      $wifi = Ler-Wifi
+      $doAp = $visiveis | Where-Object { $_.bssid -eq $wifi.bssid } | Select-Object -First 1
+      if ($doAp) { $wifi.estacoes = $doAp.estacoes; $wifi.usoCanal = $doAp.usoCanal }
+    }
+  }
   $so = Get-CimInstance Win32_OperatingSystem
   $cs = Get-CimInstance Win32_ComputerSystem
   $cpu = @(Get-CimInstance Win32_Processor)
@@ -341,7 +419,8 @@ function Montar-RelatorioPc {
       discosFisicos = @($fisicos)
       rede          = [ordered]@{
         adaptadores        = @($adaptadores)
-        wifi               = Ler-Wifi
+        wifi               = $wifi
+        wifiVisiveis       = @($visiveis)
         latenciaGatewayMs  = $latGateway
         latenciaInternetMs = $internet.latenciaMs
         perdaInternet      = $internet.perda
