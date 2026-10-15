@@ -60,6 +60,10 @@ foreach ($antiga in $antigas) {
   Write-Host "Agente antigo desligado (tarefa $($antiga.TaskName))." -ForegroundColor Cyan
 }
 
+# Atualizacao: para a rodada em andamento (ainda com o script velho). Sem isso o Windows ignora o
+# Start-ScheduledTask la embaixo enquanto ela roda, e a primeira rodada depois de instalar e a antiga.
+Stop-ScheduledTask -TaskName $TAREFA -ErrorAction SilentlyContinue
+
 New-Item -ItemType Directory -Force -Path $PASTA | Out-Null
 $destino = Join-Path $PASTA 'svt-monitor.ps1'
 $aoLado = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'svt-monitor.ps1' } else { '' }
