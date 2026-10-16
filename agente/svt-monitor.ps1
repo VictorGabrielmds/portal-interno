@@ -23,7 +23,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$VERSAO = '2.3.1'
+$VERSAO = '2.4.0'
 # $PSScriptRoot fica vazio nos valores padrao do param() do PowerShell 5.1.
 $PASTA = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if (-not $Config) { $Config = Join-Path $PASTA 'config.json' }
@@ -658,10 +658,12 @@ function Ler-UsoDosSites {
     if ([string]$dados.dia -ne $hoje) { Remove-Item $arq.FullName -Force -ErrorAction SilentlyContinue; continue }
     foreach ($s in @($dados.sites)) {
       if (-not $s.site) { continue }
-      if (-not $porSite.Contains([string]$s.site)) {
-        $porSite[[string]$s.site] = [ordered]@{ site = [string]$s.site; categoria = [string]$s.categoria; segundos = 0; segmentos = (New-Object System.Collections.ArrayList) }
+      $tipo = if ($s.tipo -in @('dominio', 'estado')) { [string]$s.tipo } else { '' }
+      $chave = "${tipo}:$($s.site)"
+      if (-not $porSite.Contains($chave)) {
+        $porSite[$chave] = [ordered]@{ site = [string]$s.site; tipo = $tipo; categoria = [string]$s.categoria; segundos = 0; segmentos = (New-Object System.Collections.ArrayList) }
       }
-      $e = $porSite[[string]$s.site]
+      $e = $porSite[$chave]
       $e.segundos += [int]$s.segundos
       foreach ($seg in @($s.segmentos)) {
         if ($seg.de -and $seg.ate) { [void]$e.segmentos.Add([ordered]@{ de = [string]$seg.de; ate = [string]$seg.ate }) }
@@ -673,7 +675,9 @@ function Ler-UsoDosSites {
   foreach ($k in $porSite.Keys) {
     $e = $porSite[$k]
     $segs = @($e.segmentos | Sort-Object { $_.de } | Select-Object -First 240)
-    $sites += [ordered]@{ site = $e.site; categoria = $e.categoria; segundos = $e.segundos; segmentos = $segs }
+    $registro = [ordered]@{ site = $e.site; categoria = $e.categoria; segundos = $e.segundos; segmentos = $segs }
+    if ($e.tipo) { $registro.tipo = $e.tipo }
+    $sites += $registro
   }
   return [ordered]@{ dia = $hoje; sites = $sites }
 }
