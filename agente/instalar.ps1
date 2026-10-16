@@ -78,6 +78,15 @@ if ($aoLado -and (Test-Path $aoLado)) {
 }
 Unblock-File $destino -ErrorAction SilentlyContinue
 
+# Atualizacao: encerra o processo do vigia que ja estava rodando (codigo ANTIGO na memoria da sessao do
+# usuario), que o Stop-ScheduledTask acima pode nao derrubar se ficou orfao. Assim a versao nova vale
+# sem deslogar, e nao ficam dois vigias ao mesmo tempo. Como administrador, alcanca as sessoes.
+try {
+  Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match 'svt-uso\.ps1' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+} catch {}
+
 # Vigia do uso de sites (roda na sessao de cada usuario). Fica dormindo ate o portal ligar a vigilancia.
 $destinoUso = Join-Path $PASTA 'svt-uso.ps1'
 $aoLadoUso = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'svt-uso.ps1' } else { '' }
