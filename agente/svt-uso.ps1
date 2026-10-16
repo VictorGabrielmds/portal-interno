@@ -49,8 +49,14 @@ public static class SvtUso {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO p);
-  [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
-  [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr h);
+  [DllImport("wtsapi32.dll", CharSet=CharSet.Unicode)] static extern bool WTSQuerySessionInformation(IntPtr server, int session, int info, out IntPtr buffer, out int bytes);
+  [DllImport("wtsapi32.dll")] static extern void WTSFreeMemory(IntPtr buffer);
+  [StructLayout(LayoutKind.Explicit)] struct SessionHeader {
+    [FieldOffset(0)] public uint Level;
+    [FieldOffset(8)] public uint SessionId;
+    [FieldOffset(12)] public int State;
+    [FieldOffset(16)] public int Flags;
+  }
   [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
   public static IntPtr Frente() { return GetForegroundWindow(); }
   public static uint Pid(IntPtr h) { uint p = 0; GetWindowThreadProcessId(h, out p); return p; }
@@ -61,10 +67,18 @@ public static class SvtUso {
     if (!GetLastInputInfo(ref li)) return -1;
     return (int)(((uint)Environment.TickCount - li.dwTime) / 1000);
   }
-  public static bool Bloqueada() {
-    IntPtr d = OpenInputDesktop(0, false, 0x0001);
-    if (d == IntPtr.Zero) return true;
-    CloseDesktop(d); return false;
+  public static string Sessao() {
+    IntPtr buffer = IntPtr.Zero; int bytes;
+    try {
+      if (!WTSQuerySessionInformation(IntPtr.Zero, -1, 25, out buffer, out bytes) || bytes < 20) return "desconhecida";
+      var info = (SessionHeader)Marshal.PtrToStructure(buffer, typeof(SessionHeader));
+      if (info.Level != 1) return "desconhecida";
+      if (info.State != 0) return "desconectada";
+      var os = Environment.OSVersion.Version;
+      if (os.Major == 6 && os.Minor == 1) return "desconhecida";
+      return info.Flags == 0 ? "bloqueada" : info.Flags == 1 ? "ativa" : "desconhecida";
+    } catch { return "desconhecida"; }
+    finally { if (buffer != IntPtr.Zero) WTSFreeMemory(buffer); }
   }
 }
 '@
@@ -77,12 +91,16 @@ try { Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes -ErrorAction 
 # na URL, busca e qualquer coisa que nao seja um dominio valido. Nunca devolve caminho, porta ou busca.
 function Host-DaUrl([string]$u) {
   $u = ([string]$u).Trim()
-  if (-not $u) { return '' }
-  $u = $u -replace '^[a-zA-Z][a-zA-Z0-9+.-]*://', ''
-  $autoridade = ($u -split '[/?#\s]')[0]
-  if ($autoridade -match '@') { return '' }
-  $dominio = (($autoridade -split ':')[0]).ToLower().TrimEnd('.')
-  if (-not $dominio -or -not $dominio.Contains('.') -or $dominio.Length -gt 253 -or $dominio.Contains('..')) { return '' }
+  if (-not $u -or $u -match '\s') { return '' }
+  if ($u -notmatch '^[a-zA-Z][a-zA-Z0-9+.-]*://') {
+    if ($u -match '^[a-zA-Z][a-zA-Z0-9+.-]*:' -and $u -notmatch '^[^/?#:\s]+:\d+([/?#]|$)') { return '' }
+    $u = 'https://' + $u
+  }
+  $uri = $null
+  if (-not [Uri]::TryCreate($u, [UriKind]::Absolute, [ref]$uri)) { return '' }
+  if ($uri.Scheme -notin @('http', 'https') -or $uri.UserInfo) { return '' }
+  $dominio = $uri.IdnHost.ToLowerInvariant().TrimEnd('.')
+  if (-not $dominio -or $dominio.Length -gt 253 -or $dominio.Contains('..')) { return '' }
   if ($dominio -notmatch '^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$') { return '' }
   foreach ($parte in $dominio.Split('.')) { if ($parte.Length -gt 63 -or $parte.StartsWith('-') -or $parte.EndsWith('-')) { return '' } }
   return $dominio
@@ -90,11 +108,9 @@ function Host-DaUrl([string]$u) {
 
 # A caixa de texto do UI Automation e a barra de endereco do navegador (e nao um campo de formulario)?
 function Eh-BarraDeEndereco([string]$automationId, [string]$name) {
-  $id = ([string]$automationId).ToLower()
-  $nm = ([string]$name).ToLower()
-  if ($id -eq 'addresseditbox' -or $id -eq 'urlbar-input' -or $id -match 'url|address|omnibox') { return $true }
-  if ($nm -match 'barra de endere|address and search|endere|url') { return $true }
-  return $false
+  if ($automationId -in @('addressEditBox', 'urlbar-input', 'urlbar', 'omnibox')) { return $true }
+  $nm = (([string]$name).Normalize([Text.NormalizationForm]::FormD) -replace '\p{Mn}', '').ToLowerInvariant()
+  return $nm -match '^(address and search bar|address bar|search or enter (web )?address|barra de enderecos?( e (de )?pesquisa)?|pesquisar ou (inserir|digitar) endereco|search with .+ or enter address|pesquisar com .+ ou (digitar|introduzir) endereco)$'
 }
 
 function Ler-Sites {
@@ -162,6 +178,7 @@ function Classificar-Uso($obs, $cfg) {
     if ($hostAtual) { return @{ nome = $hostAtual; categoria = 'Fora da lista'; tipo = 'dominio' } }
     return Estado-DeUso 'navegador_sem_dominio'
   }
+  if (-not $p) { return Estado-DeUso 'leitura_indisponivel' }
   return Estado-DeUso 'programa_fora_lista'
 }
 
@@ -179,13 +196,13 @@ function Registrar-Amostra($alvo, [datetime]$quando, [int]$segundos) {
   }
   $e = $estado[$chave]
   $e.categoria = $alvo.categoria
-  $e.segundos += $segundos
   $fimDia = $quando.Date.AddDays(1).AddSeconds(-1)
   $fim = $quando.AddSeconds($segundos); if ($fim -gt $fimDia) { $fim = $fimDia }
+  $e.segundos += [Math]::Max(0, [int]($fim - $quando).TotalSeconds)
   $de = $quando.ToString('HH:mm:ss'); $ate = $fim.ToString('HH:mm:ss')
   if ($e.abertoDe) {
     $ultimoFim = [datetime]::ParseExact(($quando.ToString('yyyy-MM-dd') + ' ' + $e.ultimo), 'yyyy-MM-dd HH:mm:ss', $null)
-    if (($quando - $ultimoFim).TotalSeconds -le $segundos) { $e.ultimo = $ate }
+    if (($quando - $ultimoFim).TotalSeconds -le 5) { $e.ultimo = $ate }
     else { Fechar-Aberto $e; $e.abertoDe = $de; $e.ultimo = $ate }
   }
   else { $e.abertoDe = $de; $e.ultimo = $ate }
@@ -232,22 +249,29 @@ function Gravar($dia) {
   } catch {}
 }
 
-# Le o valor cru da barra de endereco do navegador (so a barra, nunca campos de formulario).
+# Le somente o host da barra de endereco; nunca percorre o documento da pagina.
 function Ler-UrlDaJanela($h) {
   if (-not $UIA_OK) { return '' }
   try {
     $raiz = [System.Windows.Automation.AutomationElement]::FromHandle($h)
     if (-not $raiz) { return '' }
-    $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
-    foreach ($e in $raiz.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)) {
-      $aid = ''; $nm = ''
-      try { $aid = [string]$e.Current.AutomationId } catch {}
-      try { $nm = [string]$e.Current.Name } catch {}
-      if (-not (Eh-BarraDeEndereco $aid $nm)) { continue }
-      $vp = $null
-      if ($e.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) {
-        $v = [string]$vp.Current.Value
-        if ($v) { return $v }
+    $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+    $fila = New-Object System.Collections.Queue
+    $fila.Enqueue($raiz)
+    $vistos = 0
+    while ($fila.Count -and $vistos -lt 400) {
+      $e = $fila.Dequeue(); $vistos++
+      $info = $e.Current
+      if ($info.ControlType -eq [System.Windows.Automation.ControlType]::Document) { continue }
+      if ($info.ControlType -eq [System.Windows.Automation.ControlType]::Edit -and (Eh-BarraDeEndereco $info.AutomationId $info.Name)) {
+        if ($info.HasKeyboardFocus) { return '' }
+        $vp = $null
+        if ($e.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) { return (Host-DaUrl $vp.Current.Value) }
+      }
+      $filho = $walker.GetFirstChild($e)
+      while ($filho -and ($fila.Count + $vistos) -lt 400) {
+        $fila.Enqueue($filho)
+        $filho = $walker.GetNextSibling($filho)
       }
     }
   } catch {}
@@ -255,18 +279,20 @@ function Ler-UrlDaJanela($h) {
 }
 
 # Monta a observacao do momento a partir das APIs reais (so aqui le tela/sessao).
-function Observar {
-  $obs = @{ sessao = 'ativa'; ociosoSegundos = $null; temJanela = $false; classe = ''; processo = ''; dominio = ''; titulo = '' }
-  if ([SvtUso]::Bloqueada()) { $obs.sessao = 'bloqueada' }
+function Observar($cfg) {
+  $obs = @{ sessao = [SvtUso]::Sessao(); ociosoSegundos = $null; temJanela = $false; classe = ''; processo = ''; dominio = ''; titulo = '' }
   $o = [SvtUso]::OciosoSegundos(); if ($o -ge 0) { $obs.ociosoSegundos = $o }
+  if ($obs.sessao -in @('bloqueada', 'desconectada') -or $null -eq $obs.ociosoSegundos -or $obs.ociosoSegundos -ge $cfg.idleSegundos) { return $obs }
   $h = [SvtUso]::Frente()
   if ($h -ne [IntPtr]::Zero) {
     $obs.temJanela = $true
-    $obs.titulo = [SvtUso]::Titulo($h)
     $obs.classe = [SvtUso]::Classe($h)
     $procId = [SvtUso]::Pid($h)
     if ($procId) { $obs.processo = (Get-Process -Id $procId -ErrorAction SilentlyContinue).ProcessName }
-    if ($NAVEGADORES -contains ($obs.processo -replace '\.exe$', '').ToLower()) { $obs.dominio = Ler-UrlDaJanela $h }
+    if ($NAVEGADORES -contains ([string]$obs.processo -replace '\.exe$', '').ToLower()) {
+      $obs.dominio = Ler-UrlDaJanela $h
+      $obs.titulo = [SvtUso]::Titulo($h)
+    }
   }
   return $obs
 }
@@ -287,6 +313,7 @@ $arquivoDe = { param($dia) Join-Path $pastaUso ("{0}-{1}.json" -f $usuario, $dia
 $diaAtual = (Get-Date).ToString('yyyy-MM-dd')
 $estado = Restaurar-Estado (& $arquivoDe $diaAtual) $diaAtual
 $dominiosVistos = @{}
+foreach ($e in $estado.Values) { if ($e.tipo -eq 'dominio') { $dominiosVistos[$e.nome] = $true } }
 
 while ($true) {
   $cfg = Ler-Sites
@@ -302,14 +329,17 @@ while ($true) {
   }
 
   $amostra = $cfg.amostraSegundos
-  $alvo = Classificar-Uso (Observar) $cfg
+  try { $alvo = Classificar-Uso (Observar $cfg) $cfg } catch { $alvo = Estado-DeUso 'leitura_indisponivel' }
   if ($alvo.tipo -eq 'dominio') {
     if (-not $dominiosVistos.ContainsKey($alvo.nome)) {
       if ($dominiosVistos.Count -ge $MAX_DOMINIOS_DIA) { $alvo = Estado-DeUso 'limite_dominios' }
       else { $dominiosVistos[$alvo.nome] = $true }
     }
   }
-  Registrar-Amostra $alvo (Get-Date) $amostra
-  Gravar $hoje
+  $instante = Get-Date
+  $diaDaAmostra = $instante.ToString('yyyy-MM-dd')
+  if ($diaDaAmostra -ne $diaAtual) { Gravar $diaAtual; $estado = @{}; $dominiosVistos = @{}; $diaAtual = $diaDaAmostra }
+  Registrar-Amostra $alvo $instante $amostra
+  Gravar $diaAtual
   Start-Sleep -Seconds $amostra
 }

@@ -44,11 +44,11 @@ function Arredondar($Valor, [int]$Casas = 1) { if ($null -eq $Valor) { return $n
 # ---------------------------------------------------------------- configuracao
 
 function Ler-Config {
-  $cfg = [ordered]@{ url = ''; token = ''; coletor = $false; redes = @(); snmpComunidade = 'public' }
+  $cfg = [ordered]@{ url = ''; token = ''; coletor = $false; redes = @(); snmpComunidade = 'public'; coletarUso = $true }
   if (Test-Path $Config) {
     try {
       $lido = Get-Content $Config -Raw -Encoding UTF8 | ConvertFrom-Json
-      foreach ($campo in @('url', 'token', 'coletor', 'redes', 'snmpComunidade')) {
+      foreach ($campo in @('url', 'token', 'coletor', 'redes', 'snmpComunidade', 'coletarUso')) {
         if ($null -ne $lido.$campo) { $cfg[$campo] = $lido.$campo }
       }
     } catch { Escrever-Log "config.json invalido: $($_.Exception.Message)" }
@@ -431,7 +431,6 @@ function Montar-RelatorioPc {
       seguranca     = [ordered]@{ antivirus = @(Ler-Antivirus) }
       uptimeSegundos = [int]((Get-Date) - $so.LastBootUpTime).TotalSeconds
     }
-    uso = Ler-UsoDosSites
   }
 }
 
@@ -644,7 +643,8 @@ function Montar-Varredura($Cfg) {
 
 # ---------------------------------------------------------------- uso de sites
 
-function Ler-UsoDosSites {
+function Ler-UsoDosSites([bool]$Habilitado = $false) {
+  if (-not $Habilitado) { return $null }
   # Junta o uso de HOJE que o vigia da sessao (svt-uso.ps1) ja apurou e gravou. Nao observa nada aqui;
   # so repassa. Apaga os arquivos de dias anteriores (ja foram enviados ao longo daquele dia).
   $pastaUso = Join-Path $PASTA 'uso'
@@ -694,6 +694,11 @@ function Guardar-SitesVigiados($vigilancia) {
 # ---------------------------------------------------------------- envio
 
 function Enviar($Relatorio, $Cfg) {
+  if ($Relatorio.tipo -eq 'pc') {
+    $Relatorio.coletaUso = $Cfg.coletarUso -eq $true
+    if ($Relatorio.coletaUso) { $Relatorio.uso = Ler-UsoDosSites -Habilitado $true }
+    else { $Relatorio.Remove('uso') }
+  }
   $json = $Relatorio | ConvertTo-Json -Depth 10 -Compress
   if ($Teste) {
     Write-Output ($Relatorio | ConvertTo-Json -Depth 10)
@@ -713,7 +718,7 @@ if (-not $Teste -and (-not $cfg.url -or -not $cfg.token)) {
 
 try {
   $resposta = Enviar (Montar-RelatorioPc) $cfg
-  if ($resposta -and $resposta.vigilancia) { Guardar-SitesVigiados $resposta.vigilancia }
+  if ($cfg.coletarUso -eq $true -and $resposta -and $resposta.vigilancia) { Guardar-SitesVigiados $resposta.vigilancia }
 }
 catch { Escrever-Log "Falha no relatorio do computador: $($_.Exception.Message)" }
 

@@ -5,6 +5,7 @@
   Infraestrutura do portal (botao "Instalar agente"). Exemplos:
 
     .\instalar.ps1 -Token SEU_TOKEN
+    .\instalar.ps1 -Token SEU_TOKEN -SemUso                  (somente inventario, seguranca e rede)
     .\instalar.ps1 -Token SEU_TOKEN -Coletor                 (computador sempre ligado que varre a rede)
     .\instalar.ps1 -Token SEU_TOKEN -Coletor -Redes 192.168.0.0/24,192.168.1.0/24
     .\instalar.ps1 -Desinstalar
@@ -24,6 +25,7 @@ param(
   [string[]]$Redes = @(),
   [string]$Comunidade = 'public',
   [string]$Origem = 'https://portal.svtfaculdade.edu.br/agente',
+  [switch]$SemUso,
   [switch]$Desinstalar
 )
 
@@ -78,6 +80,8 @@ if ($aoLado -and (Test-Path $aoLado)) {
 }
 Unblock-File $destino -ErrorAction SilentlyContinue
 
+function Configurar-ColetaUso([bool]$Habilitada) {
+Stop-ScheduledTask -TaskName $TAREFA_USO -ErrorAction SilentlyContinue
 # Atualizacao: encerra o processo do vigia que ja estava rodando (codigo ANTIGO na memoria da sessao do
 # usuario), que o Stop-ScheduledTask acima pode nao derrubar se ficou orfao. Assim a versao nova vale
 # sem deslogar, e nao ficam dois vigias ao mesmo tempo. Como administrador, alcanca as sessoes.
@@ -89,6 +93,13 @@ try {
 
 # Vigia do uso de sites (roda na sessao de cada usuario). Fica dormindo ate o portal ligar a vigilancia.
 $destinoUso = Join-Path $PASTA 'svt-uso.ps1'
+if (-not $Habilitada) {
+  Unregister-ScheduledTask -TaskName $TAREFA_USO -Confirm:$false -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $destinoUso -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath (Join-Path $PASTA 'sites-vigiados.json') -Force -ErrorAction SilentlyContinue
+  Write-Host 'Modo inventario e rede: coleta de sites, programas e estados da sessao desativada neste PC.' -ForegroundColor Cyan
+  return
+}
 $aoLadoUso = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'svt-uso.ps1' } else { '' }
 if ($aoLadoUso -and (Test-Path $aoLadoUso)) {
   Copy-Item $aoLadoUso $destinoUso -Force
@@ -120,9 +131,19 @@ try {
   Set-Acl -Path $pastaUso -AclObject $aclUso
 } catch { Write-Host "Aviso: nao consegui restringir a pasta de uso ($($_.Exception.Message))." -ForegroundColor Yellow }
 
+# Somente o modo com uso cria uma tarefa na sessao do usuario.
+$acaoUso = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$destinoUso`""
+$aoLogar = New-ScheduledTaskTrigger -AtLogOn
+$contaUso = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited
+$ajustesUso = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+$ajustesUso.ExecutionTimeLimit = 'PT0S'
+Register-ScheduledTask -TaskName $TAREFA_USO -Action $acaoUso -Trigger $aoLogar -Principal $contaUso -Settings $ajustesUso -Description 'Mede sites, programas configurados e estados da sessao com aceite. Somente dominio, sem URL completa, conteudo ou titulos.' -Force | Out-Null
+Start-ScheduledTask -TaskName $TAREFA_USO -ErrorAction SilentlyContinue
+}
+
 # "-Redes a,b" chega como um texto so quando vem de outro processo.
 $listaRedes = @($Redes | ForEach-Object { $_ -split '[,; ]+' } | Where-Object { $_ })
-$config = [ordered]@{ url = $Url; token = $Token; coletor = [bool]$Coletor; redes = $listaRedes; snmpComunidade = $Comunidade }
+$config = [ordered]@{ url = $Url; token = $Token; coletor = [bool]$Coletor; redes = $listaRedes; snmpComunidade = $Comunidade; coletarUso = -not [bool]$SemUso }
 $arquivoConfig = Join-Path $PASTA 'config.json'
 [System.IO.File]::WriteAllText($arquivoConfig, ($config | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
 
@@ -145,15 +166,7 @@ $conta = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -
 $ajustes = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 4) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $TAREFA -Action $acao -Trigger @($aCada5, $aoLigar) -Principal $conta -Settings $ajustes -Description 'Envia ao Portal Interno SVT o estado deste computador (e da rede, se for o coletor).' -Force | Out-Null
 
-# Tarefa do vigia de uso: roda na sessao de QUALQUER usuario que logar, com a conta dele (nao sistema),
-# porque so a sessao do usuario enxerga a janela que esta na frente. Fica dormindo ate o portal ligar.
-$acaoUso = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$destinoUso`""
-$aoLogar = New-ScheduledTaskTrigger -AtLogOn
-$contaUso = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited
-$ajustesUso = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-$ajustesUso.ExecutionTimeLimit = 'PT0S'
-Register-ScheduledTask -TaskName $TAREFA_USO -Action $acaoUso -Trigger $aoLogar -Principal $contaUso -Settings $ajustesUso -Description 'Mede tempo em sites e programas configurados, na sessao do usuario e com aceite. Nao grava conteudo, mensagens, senhas, URLs ou titulos.' -Force | Out-Null
-Start-ScheduledTask -TaskName $TAREFA_USO -ErrorAction SilentlyContinue
+Configurar-ColetaUso (-not [bool]$SemUso)
 
 Write-Host "Agente instalado em $PASTA. Enviando o primeiro relatorio..." -ForegroundColor Cyan
 Start-ScheduledTask -TaskName $TAREFA
