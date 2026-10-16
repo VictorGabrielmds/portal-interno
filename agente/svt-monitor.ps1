@@ -23,7 +23,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$VERSAO = '2.4.0'
+$VERSAO = '2.4.1'
 # $PSScriptRoot fica vazio nos valores padrao do param() do PowerShell 5.1.
 $PASTA = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if (-not $Config) { $Config = Join-Path $PASTA 'config.json' }
