@@ -23,7 +23,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$VERSAO = '2.1.0'
+$VERSAO = '2.3.1'
 # $PSScriptRoot fica vazio nos valores padrao do param() do PowerShell 5.1.
 $PASTA = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if (-not $Config) { $Config = Join-Path $PASTA 'config.json' }
@@ -431,6 +431,7 @@ function Montar-RelatorioPc {
       seguranca     = [ordered]@{ antivirus = @(Ler-Antivirus) }
       uptimeSegundos = [int]((Get-Date) - $so.LastBootUpTime).TotalSeconds
     }
+    uso = Ler-UsoDosSites
   }
 }
 
@@ -641,17 +642,63 @@ function Montar-Varredura($Cfg) {
   }
 }
 
+# ---------------------------------------------------------------- uso de sites
+
+function Ler-UsoDosSites {
+  # Junta o uso de HOJE que o vigia da sessao (svt-uso.ps1) ja apurou e gravou. Nao observa nada aqui;
+  # so repassa. Apaga os arquivos de dias anteriores (ja foram enviados ao longo daquele dia).
+  $pastaUso = Join-Path $PASTA 'uso'
+  if (-not (Test-Path $pastaUso)) { return $null }
+  $hoje = (Get-Date).ToString('yyyy-MM-dd')
+  $porSite = [ordered]@{}
+  foreach ($arq in @(Get-ChildItem $pastaUso -Filter '*.json' -ErrorAction SilentlyContinue)) {
+    $dados = $null
+    try { $dados = Get-Content $arq.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+    if (-not $dados) { continue }
+    if ([string]$dados.dia -ne $hoje) { Remove-Item $arq.FullName -Force -ErrorAction SilentlyContinue; continue }
+    foreach ($s in @($dados.sites)) {
+      if (-not $s.site) { continue }
+      if (-not $porSite.Contains([string]$s.site)) {
+        $porSite[[string]$s.site] = [ordered]@{ site = [string]$s.site; categoria = [string]$s.categoria; segundos = 0; segmentos = (New-Object System.Collections.ArrayList) }
+      }
+      $e = $porSite[[string]$s.site]
+      $e.segundos += [int]$s.segundos
+      foreach ($seg in @($s.segmentos)) {
+        if ($seg.de -and $seg.ate) { [void]$e.segmentos.Add([ordered]@{ de = [string]$seg.de; ate = [string]$seg.ate }) }
+      }
+    }
+  }
+  if ($porSite.Count -eq 0) { return $null }
+  $sites = @()
+  foreach ($k in $porSite.Keys) {
+    $e = $porSite[$k]
+    $segs = @($e.segmentos | Sort-Object { $_.de } | Select-Object -First 240)
+    $sites += [ordered]@{ site = $e.site; categoria = $e.categoria; segundos = $e.segundos; segmentos = $segs }
+  }
+  return [ordered]@{ dia = $hoje; sites = $sites }
+}
+
+function Guardar-SitesVigiados($vigilancia) {
+  # Grava a lista de sites + liga/desliga que o portal mandou, para o vigia da sessao (usuario comum) ler.
+  # So nomes de sites e palavras-chave; nao tem segredo, entao pode ser lido pelo usuario.
+  if (-not $vigilancia) { return }
+  try {
+    [System.IO.File]::WriteAllText((Join-Path $PASTA 'sites-vigiados.json'), ($vigilancia | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+  } catch { Escrever-Log "Nao consegui gravar sites-vigiados.json: $($_.Exception.Message)" }
+}
+
 # ---------------------------------------------------------------- envio
 
 function Enviar($Relatorio, $Cfg) {
   $json = $Relatorio | ConvertTo-Json -Depth 10 -Compress
   if ($Teste) {
     Write-Output ($Relatorio | ConvertTo-Json -Depth 10)
-    return
+    return $null
   }
   $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
   $resposta = Invoke-RestMethod -Method Post -Uri $Cfg.url -Body $bytes -ContentType 'application/json; charset=utf-8' -Headers @{ Authorization = "Bearer $($Cfg.token)" } -TimeoutSec 60
   Escrever-Log ("Enviado ({0}): {1}" -f $Relatorio.tipo, ($resposta | ConvertTo-Json -Compress))
+  return $resposta
 }
 
 $cfg = Ler-Config
@@ -660,7 +707,10 @@ if (-not $Teste -and (-not $cfg.url -or -not $cfg.token)) {
   exit 1
 }
 
-try { Enviar (Montar-RelatorioPc) $cfg }
+try {
+  $resposta = Enviar (Montar-RelatorioPc) $cfg
+  if ($resposta -and $resposta.vigilancia) { Guardar-SitesVigiados $resposta.vigilancia }
+}
 catch { Escrever-Log "Falha no relatorio do computador: $($_.Exception.Message)" }
 
 if ($cfg.coletor) {

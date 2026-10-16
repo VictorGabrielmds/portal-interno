@@ -30,6 +30,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $PASTA = Join-Path $env:ProgramData 'SVT-Monitor'
 $TAREFA = 'SVT Monitor'
+$TAREFA_USO = 'SVT Monitor - Uso'
 
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -39,6 +40,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 if ($Desinstalar) {
   Unregister-ScheduledTask -TaskName $TAREFA -Confirm:$false -ErrorAction SilentlyContinue
+  Unregister-ScheduledTask -TaskName $TAREFA_USO -Confirm:$false -ErrorAction SilentlyContinue
   Remove-Item $PASTA -Recurse -Force -ErrorAction SilentlyContinue
   Write-Host 'SVT Monitor removido deste computador.' -ForegroundColor Green
   exit 0
@@ -63,6 +65,7 @@ foreach ($antiga in $antigas) {
 # Atualizacao: para a rodada em andamento (ainda com o script velho). Sem isso o Windows ignora o
 # Start-ScheduledTask la embaixo enquanto ela roda, e a primeira rodada depois de instalar e a antiga.
 Stop-ScheduledTask -TaskName $TAREFA -ErrorAction SilentlyContinue
+Stop-ScheduledTask -TaskName $TAREFA_USO -ErrorAction SilentlyContinue
 
 New-Item -ItemType Directory -Force -Path $PASTA | Out-Null
 $destino = Join-Path $PASTA 'svt-monitor.ps1'
@@ -74,6 +77,39 @@ if ($aoLado -and (Test-Path $aoLado)) {
   Invoke-WebRequest -Uri "$Origem/svt-monitor.ps1" -OutFile $destino -UseBasicParsing
 }
 Unblock-File $destino -ErrorAction SilentlyContinue
+
+# Vigia do uso de sites (roda na sessao de cada usuario). Fica dormindo ate o portal ligar a vigilancia.
+$destinoUso = Join-Path $PASTA 'svt-uso.ps1'
+$aoLadoUso = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'svt-uso.ps1' } else { '' }
+if ($aoLadoUso -and (Test-Path $aoLadoUso)) {
+  Copy-Item $aoLadoUso $destinoUso -Force
+} else {
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  Invoke-WebRequest -Uri "$Origem/svt-uso.ps1" -OutFile $destinoUso -UseBasicParsing
+}
+Unblock-File $destinoUso -ErrorAction SilentlyContinue
+
+# Pasta onde o vigia grava o uso do dia. "Caixa de deposito": cada usuario CRIA e atualiza so o SEU
+# arquivo e NAO le/lista o dos outros; o sistema (agente) e os administradores leem todos. Assim um
+# funcionario nao ve o uso de outro no mesmo computador.
+$pastaUso = Join-Path $PASTA 'uso'
+New-Item -ItemType Directory -Force -Path $pastaUso | Out-Null
+try {
+  $aclUso = New-Object System.Security.AccessControl.DirectorySecurity
+  $aclUso.SetAccessRuleProtection($true, $false)   # nao herda: so as regras abaixo valem
+  $sistema = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')      # SISTEMA
+  $admins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')   # Administradores
+  $dono = New-Object System.Security.Principal.SecurityIdentifier('S-1-3-0')          # Dono do arquivo (quem criou)
+  $usuarios = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545') # Usuarios
+  $tudo = 'ContainerInherit,ObjectInherit'
+  $aclUso.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sistema, 'FullControl', $tudo, 'None', 'Allow')))
+  $aclUso.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($admins, 'FullControl', $tudo, 'None', 'Allow')))
+  # Dono pode reescrever o proprio arquivo (vale so para os arquivos criados, nao para a pasta).
+  $aclUso.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($dono, 'Modify', 'ObjectInherit', 'InheritOnly', 'Allow')))
+  # Usuarios: so criar arquivo nesta pasta (sem listar nem abrir os dos outros).
+  $aclUso.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($usuarios, 'CreateFiles,AppendData,ReadAttributes,Synchronize', 'None', 'None', 'Allow')))
+  Set-Acl -Path $pastaUso -AclObject $aclUso
+} catch { Write-Host "Aviso: nao consegui restringir a pasta de uso ($($_.Exception.Message))." -ForegroundColor Yellow }
 
 # "-Redes a,b" chega como um texto so quando vem de outro processo.
 $listaRedes = @($Redes | ForEach-Object { $_ -split '[,; ]+' } | Where-Object { $_ })
@@ -99,6 +135,16 @@ $aoLigar = New-ScheduledTaskTrigger -AtStartup
 $conta = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 $ajustes = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 4) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $TAREFA -Action $acao -Trigger @($aCada5, $aoLigar) -Principal $conta -Settings $ajustes -Description 'Envia ao Portal Interno SVT o estado deste computador (e da rede, se for o coletor).' -Force | Out-Null
+
+# Tarefa do vigia de uso: roda na sessao de QUALQUER usuario que logar, com a conta dele (nao sistema),
+# porque so a sessao do usuario enxerga a janela que esta na frente. Fica dormindo ate o portal ligar.
+$acaoUso = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$destinoUso`""
+$aoLogar = New-ScheduledTaskTrigger -AtLogOn
+$contaUso = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited
+$ajustesUso = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+$ajustesUso.ExecutionTimeLimit = 'PT0S'
+Register-ScheduledTask -TaskName $TAREFA_USO -Action $acaoUso -Trigger $aoLogar -Principal $contaUso -Settings $ajustesUso -Description 'Mede tempo em sites e programas configurados, na sessao do usuario e com aceite. Nao grava conteudo, mensagens, senhas, URLs ou titulos.' -Force | Out-Null
+Start-ScheduledTask -TaskName $TAREFA_USO -ErrorAction SilentlyContinue
 
 Write-Host "Agente instalado em $PASTA. Enviando o primeiro relatorio..." -ForegroundColor Cyan
 Start-ScheduledTask -TaskName $TAREFA
