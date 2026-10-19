@@ -9,6 +9,8 @@
     - estado da sessao -> tela_bloqueada, sessao_desconectada, sem_interacao (sem mexer no mouse/teclado),
       sem_janela, area_de_trabalho, navegador_sem_dominio, programa_fora_lista, leitura_indisponivel,
       limite_dominios.
+    - programa_fora_lista leva o NOME do programa (ex.: spotify, nunca o titulo da janela nem o caminho);
+      navegador_sem_dominio leva o navegador e o motivo (ex.: chrome:pagina_interna).
   "Teclado/mouse" entra so como ATIVIDADE (mexeu ou nao), nunca o que foi digitado.
   Grava C:\ProgramData\SVT-Monitor\uso\<usuario>-<dia>.json; o agente de sistema envia ao portal.
   Fica desligado enquanto o portal nao mandar ligar. Instalado pela tarefa "SVT Monitor - Uso".
@@ -23,6 +25,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $NAVEGADORES = @('chrome', 'msedge', 'firefox', 'opera', 'opera_gx', 'brave', 'vivaldi', 'iexplore')
 $MAX_DOMINIOS_DIA = 200
+$MAX_DETALHES_DIA = 60   # programas fora da lista / motivos de navegador sem dominio distintos por dia
 
 # Lista usada so se o portal ainda nao tiver mandado a dele. A de verdade vem de sites-vigiados.json.
 $SITES_PADRAO = @(
@@ -158,7 +161,35 @@ function Site-DaJanela([string]$titulo, [string]$processo, [string]$hostAtual, $
   return @{ nome = ''; categoria = ''; tipo = '' }
 }
 
-function Estado-DeUso([string]$codigo) { return @{ nome = $codigo; categoria = 'Estado'; tipo = 'estado' } }
+# $detalhe so existe para dois estados: o NOME do programa fora da lista (ex.: spotify) e o navegador sem
+# dominio com o motivo (ex.: chrome:pagina_interna). Nunca titulo, caminho, documento ou texto lido.
+function Estado-DeUso([string]$codigo, [string]$detalhe = '') {
+  $alvo = @{ nome = $codigo; categoria = 'Estado'; tipo = 'estado' }
+  if ($detalhe) { $alvo.detalhe = $detalhe }
+  return $alvo
+}
+
+# Nome do programa: so o nome do processo, sem caminho nem simbolos.
+function Nome-DoPrograma([string]$processo) {
+  $limpo = (([string]$processo -replace '\.exe$', '') -replace '[^A-Za-z0-9._ -]', '').Trim().ToLower()
+  if ($limpo.Length -gt 40) { $limpo = $limpo.Substring(0, 40) }
+  return $limpo
+}
+
+# Por que a barra de endereco nao rendeu um dominio. Devolve so uma categoria; o texto lido e descartado.
+function Motivo-SemDominio([string]$valor) {
+  $v = ([string]$valor).Trim()
+  if (-not $v) { return 'barra_vazia' }
+  if ($v -match '^(chrome|edge|about|brave|opera|vivaldi|firefox|view-source|devtools|chrome-extension|moz-extension|chrome-search)(:|-)') { return 'pagina_interna' }
+  if ($v -match '^file:') { return 'arquivo_local' }
+  return 'nao_e_endereco'
+}
+
+function Detalhe-SemDominio([string]$processo, [string]$motivo) {
+  $validos = @('barra_com_foco', 'barra_vazia', 'pagina_interna', 'arquivo_local', 'nao_e_endereco', 'barra_nao_encontrada', 'leitura_falhou', 'uia_indisponivel')
+  if ($validos -notcontains $motivo) { $motivo = 'indefinido' }
+  return ('{0}:{1}' -f (Nome-DoPrograma $processo), $motivo)
+}
 
 # Classifica uma observacao (ja coletada) em um alvo. Puro: nao toca na tela nem no sistema.
 # $obs: sessao (ativa|bloqueada|desconectada), ociosoSegundos (ou $null), temJanela, classe, processo,
@@ -176,10 +207,10 @@ function Classificar-Uso($obs, $cfg) {
   if ($item.nome) { return @{ nome = $item.nome; categoria = $item.categoria; tipo = 'item' } }
   if ($NAVEGADORES -contains $p) {
     if ($hostAtual) { return @{ nome = $hostAtual; categoria = 'Fora da lista'; tipo = 'dominio' } }
-    return Estado-DeUso 'navegador_sem_dominio'
+    return Estado-DeUso 'navegador_sem_dominio' (Detalhe-SemDominio $p ([string]$obs.motivoSemDominio))
   }
   if (-not $p) { return Estado-DeUso 'leitura_indisponivel' }
-  return Estado-DeUso 'programa_fora_lista'
+  return Estado-DeUso 'programa_fora_lista' (Nome-DoPrograma $p)
 }
 
 function Fechar-Aberto($e) {
@@ -190,9 +221,10 @@ function Fechar-Aberto($e) {
 # intervalo maior que a amostra; e nao deixa um trecho atravessar a meia-noite.
 function Registrar-Amostra($alvo, [datetime]$quando, [int]$segundos) {
   $chave = if (-not $alvo.tipo -or $alvo.tipo -eq 'item') { [string]$alvo.nome } else { "$($alvo.tipo):$($alvo.nome)" }
+  if ($alvo.detalhe) { $chave = "$chave|$($alvo.detalhe)" }
   foreach ($k in @($estado.Keys)) { if ($k -ne $chave) { Fechar-Aberto $estado[$k] } }
   if (-not $estado.ContainsKey($chave)) {
-    $estado[$chave] = @{ nome = $alvo.nome; categoria = $alvo.categoria; tipo = (&{ if ($alvo.tipo) { $alvo.tipo } else { 'item' } }); segundos = 0; abertoDe = $null; ultimo = $null; fechados = (New-Object System.Collections.ArrayList) }
+    $estado[$chave] = @{ nome = $alvo.nome; categoria = $alvo.categoria; tipo = (&{ if ($alvo.tipo) { $alvo.tipo } else { 'item' } }); detalhe = [string]$alvo.detalhe; segundos = 0; abertoDe = $null; ultimo = $null; fechados = (New-Object System.Collections.ArrayList) }
   }
   $e = $estado[$chave]
   $e.categoria = $alvo.categoria
@@ -221,7 +253,9 @@ function Restaurar-Estado($arquivo, $dia) {
     $fechados = New-Object System.Collections.ArrayList
     foreach ($seg in @($s.segmentos)) { if ($seg.de -and $seg.ate) { [void]$fechados.Add([ordered]@{ de = [string]$seg.de; ate = [string]$seg.ate }) } }
     $chave = if ($tipo -eq 'item') { [string]$s.site } else { "$($tipo):$($s.site)" }
-    $e[$chave] = @{ nome = [string]$s.site; categoria = [string]$s.categoria; tipo = $tipo; segundos = [int]$s.segundos; abertoDe = $null; ultimo = $null; fechados = $fechados }
+    $detalhe = [string]$s.detalhe
+    if ($detalhe) { $chave = "$chave|$detalhe" }
+    $e[$chave] = @{ nome = [string]$s.site; categoria = [string]$s.categoria; tipo = $tipo; detalhe = $detalhe; segundos = [int]$s.segundos; abertoDe = $null; ultimo = $null; fechados = $fechados }
   }
   return $e
 }
@@ -237,6 +271,7 @@ function Gravar($dia) {
     if ($e.abertoDe) { $segmentos += [ordered]@{ de = $e.abertoDe; ate = $e.ultimo } }
     $entrada = [ordered]@{ site = $e.nome }
     if ($e.tipo -and $e.tipo -ne 'item') { $entrada.tipo = $e.tipo }
+    if ($e.detalhe) { $entrada.detalhe = $e.detalhe }
     $entrada.categoria = $e.categoria
     $entrada.segundos = [int]$e.segundos
     $entrada.segmentos = @($segmentos | Select-Object -First 240)
@@ -249,12 +284,14 @@ function Gravar($dia) {
   } catch {}
 }
 
-# Le somente o host da barra de endereco; nunca percorre o documento da pagina.
+# Le somente o host da barra de endereco; nunca percorre o documento da pagina. Devolve @{ host; motivo }:
+# quando nao ha dominio, "motivo" diz por que (barra em edicao, pagina interna do navegador, barra nao
+# encontrada...), para o portal mostrar a causa. O texto da barra nunca sai desta funcao.
 function Ler-UrlDaJanela($h) {
-  if (-not $UIA_OK) { return '' }
+  if (-not $UIA_OK) { return @{ host = ''; motivo = 'uia_indisponivel' } }
   try {
     $raiz = [System.Windows.Automation.AutomationElement]::FromHandle($h)
-    if (-not $raiz) { return '' }
+    if (-not $raiz) { return @{ host = ''; motivo = 'leitura_falhou' } }
     $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
     $fila = New-Object System.Collections.Queue
     $fila.Enqueue($raiz)
@@ -264,9 +301,15 @@ function Ler-UrlDaJanela($h) {
       $info = $e.Current
       if ($info.ControlType -eq [System.Windows.Automation.ControlType]::Document) { continue }
       if ($info.ControlType -eq [System.Windows.Automation.ControlType]::Edit -and (Eh-BarraDeEndereco $info.AutomationId $info.Name)) {
-        if ($info.HasKeyboardFocus) { return '' }
+        if ($info.HasKeyboardFocus) { return @{ host = ''; motivo = 'barra_com_foco' } }
         $vp = $null
-        if ($e.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) { return (Host-DaUrl $vp.Current.Value) }
+        if ($e.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) {
+          $valor = [string]$vp.Current.Value
+          $dominio = Host-DaUrl $valor
+          if ($dominio) { return @{ host = $dominio; motivo = '' } }
+          return @{ host = ''; motivo = (Motivo-SemDominio $valor) }
+        }
+        return @{ host = ''; motivo = 'leitura_falhou' }
       }
       $filho = $walker.GetFirstChild($e)
       while ($filho -and ($fila.Count + $vistos) -lt 400) {
@@ -274,13 +317,13 @@ function Ler-UrlDaJanela($h) {
         $filho = $walker.GetNextSibling($filho)
       }
     }
-  } catch {}
-  return ''
+  } catch { return @{ host = ''; motivo = 'leitura_falhou' } }
+  return @{ host = ''; motivo = 'barra_nao_encontrada' }
 }
 
 # Monta a observacao do momento a partir das APIs reais (so aqui le tela/sessao).
 function Observar($cfg) {
-  $obs = @{ sessao = [SvtUso]::Sessao(); ociosoSegundos = $null; temJanela = $false; classe = ''; processo = ''; dominio = ''; titulo = '' }
+  $obs = @{ sessao = [SvtUso]::Sessao(); ociosoSegundos = $null; temJanela = $false; classe = ''; processo = ''; dominio = ''; motivoSemDominio = ''; titulo = '' }
   $o = [SvtUso]::OciosoSegundos(); if ($o -ge 0) { $obs.ociosoSegundos = $o }
   if ($obs.sessao -in @('bloqueada', 'desconectada') -or $null -eq $obs.ociosoSegundos -or $obs.ociosoSegundos -ge $cfg.idleSegundos) { return $obs }
   $h = [SvtUso]::Frente()
@@ -290,8 +333,10 @@ function Observar($cfg) {
     $procId = [SvtUso]::Pid($h)
     if ($procId) { $obs.processo = (Get-Process -Id $procId -ErrorAction SilentlyContinue).ProcessName }
     if ($NAVEGADORES -contains ([string]$obs.processo -replace '\.exe$', '').ToLower()) {
-      $obs.dominio = Ler-UrlDaJanela $h
-      $obs.titulo = [SvtUso]::Titulo($h)
+      $leitura = Ler-UrlDaJanela $h
+      $obs.dominio = [string]$leitura.host
+      $obs.motivoSemDominio = [string]$leitura.motivo
+      $obs.titulo = [SvtUso]::Titulo($h)   # so para casar com a lista; nunca e gravado
     }
   }
   return $obs
@@ -313,12 +358,16 @@ $arquivoDe = { param($dia) Join-Path $pastaUso ("{0}-{1}.json" -f $usuario, $dia
 $diaAtual = (Get-Date).ToString('yyyy-MM-dd')
 $estado = Restaurar-Estado (& $arquivoDe $diaAtual) $diaAtual
 $dominiosVistos = @{}
-foreach ($e in $estado.Values) { if ($e.tipo -eq 'dominio') { $dominiosVistos[$e.nome] = $true } }
+$detalhesVistos = @{}
+foreach ($e in $estado.Values) {
+  if ($e.tipo -eq 'dominio') { $dominiosVistos[$e.nome] = $true }
+  if ($e.detalhe) { $detalhesVistos["$($e.nome)|$($e.detalhe)"] = $true }
+}
 
 while ($true) {
   $cfg = Ler-Sites
   $hoje = (Get-Date).ToString('yyyy-MM-dd')
-  if ($hoje -ne $diaAtual) { Gravar $diaAtual; $estado = @{}; $dominiosVistos = @{}; $diaAtual = $hoje }
+  if ($hoje -ne $diaAtual) { Gravar $diaAtual; $estado = @{}; $dominiosVistos = @{}; $detalhesVistos = @{}; $diaAtual = $hoje }
 
   if (-not $cfg.ativo) {
     if ($estado.Count) { $estado = @{} }
@@ -336,9 +385,17 @@ while ($true) {
       else { $dominiosVistos[$alvo.nome] = $true }
     }
   }
+  if ($alvo.detalhe) {
+    # Limite de nomes distintos por dia: acima dele, o estado fica sem nome (so a soma).
+    $chaveDetalhe = "$($alvo.nome)|$($alvo.detalhe)"
+    if (-not $detalhesVistos.ContainsKey($chaveDetalhe)) {
+      if ($detalhesVistos.Count -ge $MAX_DETALHES_DIA) { $alvo = Estado-DeUso $alvo.nome }
+      else { $detalhesVistos[$chaveDetalhe] = $true }
+    }
+  }
   $instante = Get-Date
   $diaDaAmostra = $instante.ToString('yyyy-MM-dd')
-  if ($diaDaAmostra -ne $diaAtual) { Gravar $diaAtual; $estado = @{}; $dominiosVistos = @{}; $diaAtual = $diaDaAmostra }
+  if ($diaDaAmostra -ne $diaAtual) { Gravar $diaAtual; $estado = @{}; $dominiosVistos = @{}; $detalhesVistos = @{}; $diaAtual = $diaDaAmostra }
   Registrar-Amostra $alvo $instante $amostra
   Gravar $diaAtual
   Start-Sleep -Seconds $amostra

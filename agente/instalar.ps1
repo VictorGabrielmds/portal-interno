@@ -6,6 +6,7 @@
 
     .\instalar.ps1 -Token SEU_TOKEN
     .\instalar.ps1 -Token SEU_TOKEN -SemUso                  (somente inventario, seguranca e rede)
+    .\instalar.ps1 -Token SEU_TOKEN -SemDiagnostico          (sem a coleta de desempenho, programas que pesam e eventos do Windows)
     .\instalar.ps1 -Token SEU_TOKEN -Coletor                 (computador sempre ligado que varre a rede)
     .\instalar.ps1 -Token SEU_TOKEN -Coletor -Redes 192.168.0.0/24,192.168.1.0/24
     .\instalar.ps1 -Desinstalar
@@ -26,6 +27,7 @@ param(
   [string]$Comunidade = 'public',
   [string]$Origem = 'https://portal.svtfaculdade.edu.br/agente',
   [switch]$SemUso,
+  [switch]$SemDiagnostico,
   [switch]$Desinstalar
 )
 
@@ -143,7 +145,7 @@ Start-ScheduledTask -TaskName $TAREFA_USO -ErrorAction SilentlyContinue
 
 # "-Redes a,b" chega como um texto so quando vem de outro processo.
 $listaRedes = @($Redes | ForEach-Object { $_ -split '[,; ]+' } | Where-Object { $_ })
-$config = [ordered]@{ url = $Url; token = $Token; coletor = [bool]$Coletor; redes = $listaRedes; snmpComunidade = $Comunidade; coletarUso = -not [bool]$SemUso }
+$config = [ordered]@{ url = $Url; token = $Token; coletor = [bool]$Coletor; redes = $listaRedes; snmpComunidade = $Comunidade; coletarUso = -not [bool]$SemUso; diagnostico = -not [bool]$SemDiagnostico }
 $arquivoConfig = Join-Path $PASTA 'config.json'
 [System.IO.File]::WriteAllText($arquivoConfig, ($config | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
 
@@ -182,3 +184,5 @@ if ($ultimas -match 'Enviado') {
 }
 $ultimas | ForEach-Object { Write-Host "  $_" }
 if ($Coletor) { Write-Host 'Este computador tambem varre a rede (coletor). Deixe-o sempre ligado.' -ForegroundColor Cyan }
+if ($SemDiagnostico) { Write-Host 'Diagnostico desligado neste PC (desempenho, programas que pesam e eventos do Windows nao sao enviados).' -ForegroundColor Cyan }
+else { Write-Host 'Diagnostico ligado: desempenho (CPU, disco, memoria), NOMES dos programas que mais pesam e eventos do Windows. Nunca titulo de janela, caminho, usuario ou conteudo. Para desligar neste PC: "diagnostico": false em C:\ProgramData\SVT-Monitor\config.json.' -ForegroundColor Cyan }

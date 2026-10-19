@@ -4,6 +4,10 @@
   Cada computador manda, a cada 5 minutos (tarefa agendada criada pelo instalar.ps1):
     hardware, uso de CPU/RAM/disco, rede (cabo ou Wi-Fi, sinal, velocidade), latencia ate o
     roteador e a internet, impressoras instaladas e antivirus.
+  Diagnostico (desde a 2.5.0): rajada de desempenho (CPU, disco, memoria), NOMES dos programas que
+    mais pesam e eventos do Windows (programa que travou ou fechou, desligamento inesperado, erro de
+    disco). Nunca titulo de janela, caminho, linha de comando, usuario ou conteudo. Desliga com
+    "diagnostico": false no config.json.
   O computador "coletor" (um que fica sempre ligado) tambem varre a rede: quem responde,
   MAC, nome, portas abertas, impressoras por SNMP (status, toner, contador) e a internet.
 
@@ -23,7 +27,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$VERSAO = '2.4.1'
+$VERSAO = '2.5.0'
 # $PSScriptRoot fica vazio nos valores padrao do param() do PowerShell 5.1.
 $PASTA = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if (-not $Config) { $Config = Join-Path $PASTA 'config.json' }
@@ -44,11 +48,11 @@ function Arredondar($Valor, [int]$Casas = 1) { if ($null -eq $Valor) { return $n
 # ---------------------------------------------------------------- configuracao
 
 function Ler-Config {
-  $cfg = [ordered]@{ url = ''; token = ''; coletor = $false; redes = @(); snmpComunidade = 'public'; coletarUso = $true }
+  $cfg = [ordered]@{ url = ''; token = ''; coletor = $false; redes = @(); snmpComunidade = 'public'; coletarUso = $true; diagnostico = $true }
   if (Test-Path $Config) {
     try {
       $lido = Get-Content $Config -Raw -Encoding UTF8 | ConvertFrom-Json
-      foreach ($campo in @('url', 'token', 'coletor', 'redes', 'snmpComunidade', 'coletarUso')) {
+      foreach ($campo in @('url', 'token', 'coletor', 'redes', 'snmpComunidade', 'coletarUso', 'diagnostico')) {
         if ($null -ne $lido.$campo) { $cfg[$campo] = $lido.$campo }
       }
     } catch { Escrever-Log "config.json invalido: $($_.Exception.Message)" }
@@ -346,7 +350,7 @@ function Ler-Antivirus {
   return $lista
 }
 
-function Montar-RelatorioPc {
+function Montar-RelatorioPc($Cfg = $null) {
   # Wi-Fi: so em computador com placa de Wi-Fi ligada.
   $wifi = Ler-Wifi
   $visiveis = @()
@@ -384,6 +388,12 @@ function Montar-RelatorioPc {
   $dnsOk = Testar-Dns
 
   $ramTotalMB = [int][math]::Round($so.TotalVisibleMemorySize / 1024)
+  # Diagnostico (desempenho, programas que pesam, eventos do Windows): desliga com "diagnostico": false no config.json.
+  $diagnostico = $null
+  if ($Cfg -and $Cfg.diagnostico -eq $true) {
+    try { $diagnostico = Ler-Diagnostico ([int](($cpu | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum)) }
+    catch { Escrever-Log "Falha no diagnostico: $($_.Exception.Message)" }
+  }
   return [ordered]@{
     versao = $VERSAO
     tipo   = 'pc'
@@ -430,8 +440,317 @@ function Montar-RelatorioPc {
       impressoras   = @(Ler-Impressoras)
       seguranca     = [ordered]@{ antivirus = @(Ler-Antivirus) }
       uptimeSegundos = [int]((Get-Date) - $so.LastBootUpTime).TotalSeconds
+      diagnostico    = $diagnostico
     }
   }
+}
+
+# ---------------------------------------------------------------- diagnostico (desempenho, programas, eventos do Windows)
+#
+# Responde "o computador trava? o que pesa? aguenta o que fazem nele?" sem olhar o que a pessoa faz:
+#   - desempenho: rajada de ~5 s com CPU, fila da CPU, disco ocupado, latencia do disco, leituras de
+#     memoria no disco (paginacao), memoria comprometida e limite de desempenho do processador;
+#   - programas que mais pesaram AGORA: so o NOME do programa, % de CPU e MB de memoria (nunca caminho,
+#     linha de comando, titulo de janela, usuario ou conteudo);
+#   - eventos do Windows desde o ultimo relatorio: programa que parou de responder, programa que
+#     fechou com erro, desligamento inesperado, reinicio (atualizacao/usuario), erro de disco,
+#     erro de hardware (WHEA), memoria esgotada e driver de video. So contagens e o nome do programa;
+#   - uma vez por hora: saude do disco (temperatura, desgaste, erros), quantidade de programas na
+#     inicializacao e o tempo da ultima inicializacao.
+# Desliga num computador com  "diagnostico": false  no config.json.
+
+$ARQUIVO_DIAGNOSTICO = Join-Path $PASTA 'diagnostico-estado.json'
+$JANELA_EVENTOS_MAXIMA_HORAS = 24
+
+function Nome-DoProcesso([string]$Nome) {
+  # "chrome#3" -> "chrome"; tira ".exe". Nada alem do nome do programa.
+  $limpo = ([string]$Nome -replace '#\d+$', '' -replace '\.exe$', '').Trim()
+  if ($limpo.Length -gt 40) { $limpo = $limpo.Substring(0, 40) }
+  return $limpo
+}
+
+function Resumir-Processos($Linhas, [int]$Nucleos, [int]$MeuPid = 0) {
+  # Junta os processos de mesmo nome (o Chrome tem varios) e devolve os que mais pesam em CPU e
+  # em memoria. CPU em % do computador inteiro; memoria em MB privados.
+  if ($Nucleos -lt 1) { $Nucleos = 1 }
+  $grupos = @{}
+  foreach ($l in @($Linhas)) {
+    if (-not $l) { continue }
+    $nome = Nome-DoProcesso $l.Name
+    if (-not $nome -or $nome -eq '_Total' -or $nome -eq 'Idle') { continue }
+    if ($MeuPid -gt 0 -and [int]$l.IDProcess -eq $MeuPid) { continue }
+    if (-not $grupos.ContainsKey($nome)) { $grupos[$nome] = [pscustomobject]@{ nome = $nome; cpu = 0.0; bytes = 0.0 } }
+    $grupos[$nome].cpu += [double]$l.PercentProcessorTime
+    $memoria = if ($null -ne $l.WorkingSetPrivate) { [double]$l.WorkingSetPrivate } else { [double]$l.WorkingSet }
+    $grupos[$nome].bytes += $memoria
+  }
+  $todos = @($grupos.Values | ForEach-Object {
+      [pscustomobject]@{ nome = $_.nome; cpu = [math]::Min(100.0, [math]::Round($_.cpu / $Nucleos, 1)); memMB = [int][math]::Round($_.bytes / 1MB) }
+    })
+  $porCpu = @($todos | Where-Object { $_.cpu -ge 1 } | Sort-Object -Property cpu -Descending | Select-Object -First 3)
+  $porMemoria = @($todos | Where-Object { $_.memMB -ge 100 } | Sort-Object -Property memMB -Descending | Select-Object -First 3)
+  $vistos = @{}
+  $saida = @()
+  foreach ($p in @($porCpu) + @($porMemoria)) {
+    if ($vistos.ContainsKey($p.nome)) { continue }
+    $vistos[$p.nome] = $true
+    $saida += [ordered]@{ nome = $p.nome; cpu = $p.cpu; memMB = $p.memMB }
+  }
+  return $saida
+}
+
+function Calcular-LatenciaDisco($Antes, $Depois) {
+  # Tempo medio por operacao de disco (ms) entre duas leituras brutas (contador PERF_AVERAGE_TIMER).
+  if (-not $Antes -or -not $Depois) { return $null }
+  $dn = [double]$Depois.AvgDisksecPerTransfer - [double]$Antes.AvgDisksecPerTransfer
+  $dd = [double]$Depois.AvgDisksecPerTransfer_Base - [double]$Antes.AvgDisksecPerTransfer_Base
+  $f = [double]$Depois.Frequency_PerfTime
+  if ($dd -le 0 -or $f -le 0 -or $dn -lt 0) { return $null }
+  return [math]::Round(1000 * ($dn / $f) / $dd, 1)
+}
+
+function Resumir-Serie($Valores) {
+  $validos = @($Valores | Where-Object { $null -ne $_ })
+  if (-not $validos.Count) { return $null }
+  $m = $validos | Measure-Object -Average -Maximum
+  return [pscustomobject]@{ media = [math]::Round([double]$m.Average, 1); max = [math]::Round([double]$m.Maximum, 1) }
+}
+
+function Classificar-Reinicio([string]$Processo, $Codigo) {
+  # Evento 1074 (reinicio/desligamento pedido): so classifica; o caminho e o usuario NAO sao guardados.
+  if ($Processo -match 'TiWorker|TrustedInstaller|wuauclt|MoUsoCoreWorker|USOClient|musnotification|WindowsUpdate') { return 'atualizacao' }
+  if ($Processo -match 'explorer|winlogon|shutdown|LogonUI|RuntimeBroker|SystemSettings|StartMenuExperienceHost|ShellExperienceHost') { return 'usuario' }
+  return 'outro'
+}
+
+function Nome-SeguroDoApp($Valor) {
+  # Nome de programa vindo do registro de eventos: so letras, numeros e . _ - + ( ) espaco.
+  $texto = ([string]$Valor -replace '[^A-Za-z0-9._+() -]', '').Trim()
+  if ($texto.Length -gt 40) { $texto = $texto.Substring(0, 40) }
+  return $texto
+}
+
+function Agrupar-Eventos($Itens, [int]$Maximo = 30) {
+  # Junta eventos iguais (mesmo tipo, programa e detalhe) em um registro com a quantidade e o ultimo horario.
+  $grupos = @{}
+  foreach ($i in @($Itens)) {
+    if (-not $i) { continue }
+    $chave = '{0}|{1}|{2}' -f $i.Tipo, $i.App, $i.Detalhe
+    if (-not $grupos.ContainsKey($chave)) { $grupos[$chave] = [pscustomobject]@{ tipo = $i.Tipo; app = $i.App; detalhe = $i.Detalhe; vezes = 0; em = $i.Em } }
+    $grupos[$chave].vezes += 1
+    if ($i.Em -gt $grupos[$chave].em) { $grupos[$chave].em = $i.Em }
+  }
+  return @($grupos.Values | Sort-Object -Property em -Descending | Select-Object -First $Maximo | ForEach-Object {
+      [ordered]@{ tipo = $_.tipo; app = $_.app; detalhe = $_.detalhe; vezes = $_.vezes; em = (Iso $_.em) }
+    })
+}
+
+function Ler-EstadoDiagnostico {
+  $estado = [ordered]@{ ultimaLeitura = ''; ultimaHora = ''; ultimoBoot = '' }
+  if (Test-Path $ARQUIVO_DIAGNOSTICO) {
+    try {
+      $lido = Get-Content $ARQUIVO_DIAGNOSTICO -Raw -Encoding UTF8 | ConvertFrom-Json
+      foreach ($campo in @('ultimaLeitura', 'ultimaHora', 'ultimoBoot')) { if ($lido.$campo) { $estado[$campo] = [string]$lido.$campo } }
+    } catch { Escrever-Log "diagnostico-estado.json invalido: $($_.Exception.Message)" }
+  }
+  return $estado
+}
+
+function Gravar-EstadoDiagnostico($Estado) {
+  try { [System.IO.File]::WriteAllText($ARQUIVO_DIAGNOSTICO, ($Estado | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false))) }
+  catch { Escrever-Log "Nao consegui gravar diagnostico-estado.json: $($_.Exception.Message)" }
+}
+
+function Data-DoEstado([string]$Texto) {
+  if (-not $Texto) { return $null }
+  try { return [datetime]::Parse($Texto, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToLocalTime() } catch { return $null }
+}
+
+function Ler-ContadoresDesempenho {
+  # Classes WMI de desempenho (os nomes dos contadores do Get-Counter mudam com o idioma do Windows).
+  $r = [ordered]@{}
+  try { $r.cpu = [double](Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'" -ErrorAction Stop).PercentProcessorTime } catch {}
+  try { $r.filaCpu = [double](Get-CimInstance Win32_PerfFormattedData_PerfOS_System -ErrorAction Stop).ProcessorQueueLength } catch {}
+  try {
+    $d = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction Stop
+    $r.discoOcupado = [math]::Min(100.0, [math]::Max(0.0, 100.0 - [double]$d.PercentIdleTime))
+    $r.filaDisco = [double]$d.CurrentDiskQueueLength
+  } catch {}
+  try {
+    $m = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop
+    $r.paginasLidas = [double]$m.PagesInputPersec
+    $r.comprometida = [double]$m.PercentCommittedBytesInUse
+    $r.disponivelMB = [double]$m.AvailableMBytes
+  } catch {}
+  try {
+    $f = Get-CimInstance Win32_PerfFormattedData_Counters_ProcessorInformation -Filter "Name='_Total'" -ErrorAction Stop
+    if ($null -ne $f.PercentPerformanceLimit) { $r.limiteDesempenho = [double]$f.PercentPerformanceLimit }
+    if ($null -ne $f.PercentOfMaximumFrequency) { $r.frequencia = [double]$f.PercentOfMaximumFrequency }
+  } catch {}
+  return $r
+}
+
+function Ler-DiscoBruto {
+  try {
+    return (Get-CimInstance Win32_PerfRawData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction Stop | Select-Object AvgDisksecPerTransfer, AvgDisksecPerTransfer_Base, Frequency_PerfTime)
+  } catch { return $null }
+}
+
+function Medir-Desempenho([int]$Nucleos, [int]$Amostras = 5) {
+  # A 1a leitura e descartada: o Windows calcula os contadores formatados desde a leitura anterior.
+  [void](Ler-ContadoresDesempenho)
+  $processosAntes = $null
+  try { $processosAntes = Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -ErrorAction Stop } catch {}
+  $discoAntes = Ler-DiscoBruto
+  $leituras = @()
+  for ($i = 0; $i -lt $Amostras; $i++) {
+    Start-Sleep -Milliseconds 1000
+    $leituras += , (Ler-ContadoresDesempenho)
+  }
+  $discoDepois = Ler-DiscoBruto
+  $processos = @()
+  try { $processos = Resumir-Processos (Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -ErrorAction Stop) $Nucleos $PID } catch { Escrever-Log "Diagnostico: processos indisponiveis ($($_.Exception.Message))" }
+  $serie = { param([string]$Campo) Resumir-Serie @($leituras | ForEach-Object { if ($_.Contains($Campo)) { $_[$Campo] } }) }
+  $cpu = & $serie 'cpu'
+  $fila = & $serie 'filaCpu'
+  $ocupado = & $serie 'discoOcupado'
+  $filaDisco = & $serie 'filaDisco'
+  $paginas = & $serie 'paginasLidas'
+  $comprometida = & $serie 'comprometida'
+  $disponivel = & $serie 'disponivelMB'
+  $limite = & $serie 'limiteDesempenho'
+  $frequencia = & $serie 'frequencia'
+  $desempenho = [ordered]@{ amostras = $leituras.Count }
+  if ($cpu) { $desempenho.cpuMedia = $cpu.media; $desempenho.cpuMax = $cpu.max }
+  if ($fila) { $desempenho.filaCpuMedia = $fila.media; $desempenho.filaCpuMax = $fila.max }
+  if ($ocupado) { $desempenho.discoOcupadoMedia = $ocupado.media; $desempenho.discoOcupadoMax = $ocupado.max }
+  if ($filaDisco) { $desempenho.filaDiscoMedia = $filaDisco.media; $desempenho.filaDiscoMax = $filaDisco.max }
+  $latencia = Calcular-LatenciaDisco $discoAntes $discoDepois
+  if ($null -ne $latencia) { $desempenho.discoLatenciaMs = $latencia }
+  if ($paginas) { $desempenho.paginasLidasPorSeg = $paginas.media }
+  if ($comprometida) { $desempenho.memoriaComprometidaPct = $comprometida.media }
+  if ($disponivel) { $desempenho.memoriaDisponivelMB = [int]$disponivel.media }
+  if ($limite) { $desempenho.limiteDesempenhoPct = $limite.max }
+  if ($frequencia) { $desempenho.frequenciaPct = $frequencia.media }
+  return [pscustomobject]@{ desempenho = $desempenho; processos = @($processos) }
+}
+
+function Ler-EventosDoWindows([datetime]$Desde) {
+  # Consultas por provedor e numero do evento (nao dependem do idioma). Propriedades, nunca a mensagem.
+  $consultas = @(
+    @{ Tipo = 'travamento'; Filtro = @{ LogName = 'Application'; ProviderName = 'Application Hang'; Id = 1002 }; App = 0 },
+    @{ Tipo = 'falha_app'; Filtro = @{ LogName = 'Application'; ProviderName = 'Application Error'; Id = 1000 }; App = 0 },
+    @{ Tipo = 'desligamento_inesperado'; Filtro = @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 41 }; App = -1 },
+    @{ Tipo = 'desligamento_inesperado_6008'; Filtro = @{ LogName = 'System'; ProviderName = 'EventLog'; Id = 6008 }; App = -1 },
+    @{ Tipo = 'reinicio'; Filtro = @{ LogName = 'System'; ProviderName = 'User32'; Id = 1074 }; App = -1 },
+    @{ Tipo = 'erro_disco'; Filtro = @{ LogName = 'System'; ProviderName = 'disk'; Id = @(7, 11, 15, 51, 52) }; App = -1 },
+    @{ Tipo = 'erro_disco'; Filtro = @{ LogName = 'System'; ProviderName = 'Ntfs'; Id = 55 }; App = -1 },
+    @{ Tipo = 'erro_disco'; Filtro = @{ LogName = 'System'; ProviderName = @('storahci', 'stornvme'); Id = 129 }; App = -1 },
+    @{ Tipo = 'erro_hardware'; Filtro = @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WHEA-Logger'; Id = @(17, 18, 19, 20, 47) }; App = -1 },
+    @{ Tipo = 'memoria_esgotada'; Filtro = @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Resource-Exhaustion-Detector'; Id = 2004 }; App = -1 },
+    @{ Tipo = 'driver_video'; Filtro = @{ LogName = 'System'; ProviderName = 'Display'; Id = 4101 }; App = -1 }
+  )
+  $itens = @()
+  foreach ($c in $consultas) {
+    $filtro = $c.Filtro.Clone()
+    $filtro.StartTime = $Desde
+    $encontrados = @()
+    try { $encontrados = @(Get-WinEvent -FilterHashtable $filtro -MaxEvents 200 -ErrorAction Stop) }
+    catch {
+      if ($_.FullyQualifiedErrorId -notmatch 'NoMatchingEventsFound') { Escrever-Log "Diagnostico: eventos '$($c.Tipo)' indisponiveis ($($_.Exception.Message))" }
+      continue
+    }
+    foreach ($e in $encontrados) {
+      $app = ''
+      $detalhe = ''
+      $tipo = $c.Tipo
+      try {
+        if ($c.App -ge 0 -and $e.Properties.Count -gt $c.App) { $app = Nome-SeguroDoApp $e.Properties[$c.App].Value }
+        if ($tipo -eq 'reinicio') { $detalhe = Classificar-Reinicio ([string]$e.Properties[0].Value) $e.Properties[3].Value }
+        elseif ($tipo -eq 'erro_disco' -or $tipo -eq 'erro_hardware') { $detalhe = '{0}:{1}' -f (Nome-SeguroDoApp $e.ProviderName), $e.Id }
+      } catch {}
+      $itens += [pscustomobject]@{ Tipo = $tipo; App = $app; Detalhe = $detalhe; Em = $e.TimeCreated }
+    }
+  }
+  # 6008 e 41 descrevem o mesmo desligamento: so conta o 6008 quando nao ha 41.
+  if (@($itens | Where-Object { $_.Tipo -eq 'desligamento_inesperado' }).Count -gt 0) {
+    $itens = @($itens | Where-Object { $_.Tipo -ne 'desligamento_inesperado_6008' })
+  } else {
+    foreach ($i in @($itens | Where-Object { $_.Tipo -eq 'desligamento_inesperado_6008' })) { $i.Tipo = 'desligamento_inesperado' }
+  }
+  return @(Agrupar-Eventos $itens 30)
+}
+
+function Ler-InicioDoWindows($Estado) {
+  # Duracao da ultima inicializacao (Diagnostics-Performance, evento 100). So devolve se for nova.
+  try {
+    $e = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Diagnostics-Performance/Operational'; Id = 100 } -MaxEvents 1 -ErrorAction Stop
+    $em = Iso $e.TimeCreated
+    if ($em -eq $Estado.ultimoBoot) { return $null }
+    $xml = [xml]$e.ToXml()
+    $ms = [double](($xml.Event.EventData.Data | Where-Object { $_.Name -eq 'BootTime' }).'#text')
+    if ($ms -le 0) { return $null }
+    $Estado.ultimoBoot = $em
+    return [ordered]@{ duracaoSegundos = [int][math]::Round($ms / 1000); em = $em }
+  } catch { return $null }
+}
+
+function Ler-SaudeDosDiscos {
+  $lista = @()
+  try {
+    foreach ($d in @(Get-PhysicalDisk -ErrorAction Stop)) {
+      $c = $null
+      try { $c = $d | Get-StorageReliabilityCounter -ErrorAction Stop } catch {}
+      if (-not $c) { continue }
+      $lista += [ordered]@{
+        modelo       = (Nome-SeguroDoApp $d.FriendlyName)
+        temperaturaC = if ($null -ne $c.Temperature) { [int]$c.Temperature } else { $null }
+        desgastePct  = if ($null -ne $c.Wear) { [int]$c.Wear } else { $null }
+        errosLeitura = if ($null -ne $c.ReadErrorsTotal) { [int64]$c.ReadErrorsTotal } else { $null }
+        errosEscrita = if ($null -ne $c.WriteErrorsTotal) { [int64]$c.WriteErrorsTotal } else { $null }
+        horasLigado  = if ($null -ne $c.PowerOnHours) { [int64]$c.PowerOnHours } else { $null }
+      }
+    }
+  } catch {}
+  return $lista
+}
+
+function Reinicio-Pendente {
+  foreach ($caminho in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')) {
+    try { if (Test-Path $caminho) { return $true } } catch {}
+  }
+  return $false
+}
+
+function Ler-Diagnostico([int]$Nucleos) {
+  # Devolve o diagnostico e deixa o novo estado em $script:EstadoDiagnosticoNovo (so gravado depois que o portal confirma o envio).
+  $estado = Ler-EstadoDiagnostico
+  $agora = Get-Date
+  $desde = Data-DoEstado $estado.ultimaLeitura
+  if (-not $desde -or $desde -lt $agora.AddHours(-$JANELA_EVENTOS_MAXIMA_HORAS)) { $desde = $agora.AddHours(-$JANELA_EVENTOS_MAXIMA_HORAS) }
+  if ($desde -gt $agora) { $desde = $agora.AddMinutes(-5) }
+
+  $diag = [ordered]@{ versao = 1; coletadoEm = (Iso $agora) }
+  try {
+    $medido = Medir-Desempenho $Nucleos 5
+    $diag.desempenho = $medido.desempenho
+    $diag.processos = @($medido.processos)
+  } catch { Escrever-Log "Diagnostico: desempenho indisponivel ($($_.Exception.Message))" }
+  try { $diag.eventos = @(Ler-EventosDoWindows $desde) } catch { Escrever-Log "Diagnostico: eventos indisponiveis ($($_.Exception.Message))" }
+  $diag.reinicioPendente = Reinicio-Pendente
+
+  $ultimaHora = Data-DoEstado $estado.ultimaHora
+  if (-not $ultimaHora -or $ultimaHora -lt $agora.AddMinutes(-60)) {
+    $inicio = Ler-InicioDoWindows $estado
+    if ($inicio) { $diag.boot = $inicio }
+    $discos = @(Ler-SaudeDosDiscos)
+    if ($discos.Count) { $diag.discos = $discos }
+    try { $diag.programasNaInicializacao = @(Get-CimInstance Win32_StartupCommand -ErrorAction Stop).Count } catch {}
+    $estado.ultimaHora = (Iso $agora)
+  }
+  $estado.ultimaLeitura = (Iso $agora)
+  $script:EstadoDiagnosticoNovo = $estado
+  return $diag
 }
 
 # ---------------------------------------------------------------- varredura (computador coletor)
@@ -659,9 +978,10 @@ function Ler-UsoDosSites([bool]$Habilitado = $false) {
     foreach ($s in @($dados.sites)) {
       if (-not $s.site) { continue }
       $tipo = if ($s.tipo -in @('dominio', 'estado')) { [string]$s.tipo } else { '' }
-      $chave = "${tipo}:$($s.site)"
+      $detalhe = [string]$s.detalhe   # so nome de programa fora da lista ou navegador:motivo (nunca titulo ou caminho)
+      $chave = "${tipo}:$($s.site)|$detalhe"
       if (-not $porSite.Contains($chave)) {
-        $porSite[$chave] = [ordered]@{ site = [string]$s.site; tipo = $tipo; categoria = [string]$s.categoria; segundos = 0; segmentos = (New-Object System.Collections.ArrayList) }
+        $porSite[$chave] = [ordered]@{ site = [string]$s.site; tipo = $tipo; detalhe = $detalhe; categoria = [string]$s.categoria; segundos = 0; segmentos = (New-Object System.Collections.ArrayList) }
       }
       $e = $porSite[$chave]
       $e.segundos += [int]$s.segundos
@@ -677,6 +997,7 @@ function Ler-UsoDosSites([bool]$Habilitado = $false) {
     $segs = @($e.segmentos | Sort-Object { $_.de } | Select-Object -First 240)
     $registro = [ordered]@{ site = $e.site; categoria = $e.categoria; segundos = $e.segundos; segmentos = $segs }
     if ($e.tipo) { $registro.tipo = $e.tipo }
+    if ($e.detalhe) { $registro.detalhe = $e.detalhe }
     $sites += $registro
   }
   return [ordered]@{ dia = $hoje; sites = $sites }
@@ -717,7 +1038,10 @@ if (-not $Teste -and (-not $cfg.url -or -not $cfg.token)) {
 }
 
 try {
-  $resposta = Enviar (Montar-RelatorioPc) $cfg
+  $resposta = Enviar (Montar-RelatorioPc $cfg) $cfg
+  if ($Teste -and $resposta) { Write-Output $resposta }   # no -Teste, Enviar devolve o JSON em vez de enviar
+  # So avanca a janela dos eventos depois que o portal confirmou o envio (senao a proxima rodada repete).
+  if (-not $Teste -and $resposta -and $resposta.historicoGravado -eq $true -and $script:EstadoDiagnosticoNovo) { Gravar-EstadoDiagnostico $script:EstadoDiagnosticoNovo }
   if ($cfg.coletarUso -eq $true -and $resposta -and $resposta.vigilancia) { Guardar-SitesVigiados $resposta.vigilancia }
 }
 catch { Escrever-Log "Falha no relatorio do computador: $($_.Exception.Message)" }
