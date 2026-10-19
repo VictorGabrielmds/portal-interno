@@ -8,6 +8,7 @@
     .\instalar.ps1 -Token SEU_TOKEN -SemUso                  (somente inventario, seguranca e rede)
     .\instalar.ps1 -Token SEU_TOKEN -SemDiagnostico          (sem a coleta de desempenho, programas que pesam e eventos do Windows)
     .\instalar.ps1 -Token SEU_TOKEN -SemSondagem             (sem a sondagem da rede: rota ate a internet, saltos e latencia)
+    .\instalar.ps1 -Token SEU_TOKEN -SemAviso                (sem o aviso de desligamento: o portal nao distingue desligado de sem rede)
     .\instalar.ps1 -Token SEU_TOKEN -Coletor                 (computador sempre ligado que varre a rede)
     .\instalar.ps1 -Token SEU_TOKEN -Coletor -Redes 192.168.0.0/24,192.168.1.0/24
     .\instalar.ps1 -Desinstalar
@@ -30,6 +31,7 @@ param(
   [switch]$SemUso,
   [switch]$SemDiagnostico,
   [switch]$SemSondagem,
+  [switch]$SemAviso,
   [switch]$Desinstalar
 )
 
@@ -37,6 +39,24 @@ $ErrorActionPreference = 'Stop'
 $PASTA = Join-Path $env:ProgramData 'SVT-Monitor'
 $TAREFA = 'SVT Monitor'
 $TAREFA_USO = 'SVT Monitor - Uso'
+$TAREFAS_AVISO = @('SVT Monitor - Aviso (desligar)', 'SVT Monitor - Aviso (suspender)')
+
+# Consulta de evento do Windows (XML) para o gatilho de uma tarefa agendada.
+function Montar-ConsultaDeEvento([string]$Log, [string]$Provedor, [int]$Id) {
+  return ('<QueryList><Query Id="0" Path="{0}"><Select Path="{0}">*[System[Provider[@Name=''{1}''] and EventID={2}]]</Select></Query></QueryList>' -f $Log, $Provedor, $Id)
+}
+
+# Tarefa que roda  svt-monitor.ps1 -Aviso <estado>  quando o Windows registra o evento (desligar, suspender).
+function Registrar-AvisoDeEnergia([string]$Nome, [string]$Consulta, [string]$Estado, [string]$Script) {
+  $classe = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace Root/Microsoft/Windows/TaskScheduler
+  $gatilho = New-CimInstance -CimClass $classe -ClientOnly
+  $gatilho.Enabled = $true
+  $gatilho.Subscription = $Consulta
+  $acao = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Script`" -Aviso $Estado"
+  $conta = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+  $ajustes = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+  Register-ScheduledTask -TaskName $Nome -Action $acao -Trigger $gatilho -Principal $conta -Settings $ajustes -Description 'Avisa o Portal Interno SVT que este computador esta desligando ou suspendendo (so o nome do computador, o estado e a hora).' -Force | Out-Null
+}
 
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -47,6 +67,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 if ($Desinstalar) {
   Unregister-ScheduledTask -TaskName $TAREFA -Confirm:$false -ErrorAction SilentlyContinue
   Unregister-ScheduledTask -TaskName $TAREFA_USO -Confirm:$false -ErrorAction SilentlyContinue
+  foreach ($aviso in $TAREFAS_AVISO) { Unregister-ScheduledTask -TaskName $aviso -Confirm:$false -ErrorAction SilentlyContinue }
   Remove-Item $PASTA -Recurse -Force -ErrorAction SilentlyContinue
   Write-Host 'SVT Monitor removido deste computador.' -ForegroundColor Green
   exit 0
@@ -147,7 +168,7 @@ Start-ScheduledTask -TaskName $TAREFA_USO -ErrorAction SilentlyContinue
 
 # "-Redes a,b" chega como um texto so quando vem de outro processo.
 $listaRedes = @($Redes | ForEach-Object { $_ -split '[,; ]+' } | Where-Object { $_ })
-$config = [ordered]@{ url = $Url; token = $Token; coletor = [bool]$Coletor; redes = $listaRedes; snmpComunidade = $Comunidade; coletarUso = -not [bool]$SemUso; diagnostico = -not [bool]$SemDiagnostico; sondagem = -not [bool]$SemSondagem }
+$config = [ordered]@{ url = $Url; token = $Token; coletor = [bool]$Coletor; redes = $listaRedes; snmpComunidade = $Comunidade; coletarUso = -not [bool]$SemUso; diagnostico = -not [bool]$SemDiagnostico; sondagem = -not [bool]$SemSondagem; avisoDeEnergia = -not [bool]$SemAviso }
 $arquivoConfig = Join-Path $PASTA 'config.json'
 [System.IO.File]::WriteAllText($arquivoConfig, ($config | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
 
@@ -171,6 +192,18 @@ $ajustes = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionT
 Register-ScheduledTask -TaskName $TAREFA -Action $acao -Trigger @($aCada5, $aoLigar) -Principal $conta -Settings $ajustes -Description 'Envia ao Portal Interno SVT o estado deste computador (e da rede, se for o coletor).' -Force | Out-Null
 
 Configurar-ColetaUso (-not [bool]$SemUso)
+
+# Avisos de energia: desligar/reiniciar (User32 1074) e entrar em suspensao (Kernel-Power 42).
+if ($SemAviso) {
+  foreach ($aviso in $TAREFAS_AVISO) { Unregister-ScheduledTask -TaskName $aviso -Confirm:$false -ErrorAction SilentlyContinue }
+  Write-Host 'Aviso de desligamento desligado neste PC: o portal nao distingue desligado de sem rede.' -ForegroundColor Cyan
+} else {
+  try {
+    Registrar-AvisoDeEnergia $TAREFAS_AVISO[0] (Montar-ConsultaDeEvento 'System' 'User32' 1074) 'desligando' $destino
+    Registrar-AvisoDeEnergia $TAREFAS_AVISO[1] (Montar-ConsultaDeEvento 'System' 'Microsoft-Windows-Kernel-Power' 42) 'suspendendo' $destino
+    Write-Host 'Aviso de desligamento ligado: o portal sabe quando o computador desliga ou suspende (so o nome do computador, o estado e a hora).' -ForegroundColor Cyan
+  } catch { Write-Host "Aviso: nao consegui criar as tarefas de aviso de desligamento ($($_.Exception.Message))." -ForegroundColor Yellow }
+}
 
 Write-Host "Agente instalado em $PASTA. Enviando o primeiro relatorio..." -ForegroundColor Cyan
 Start-ScheduledTask -TaskName $TAREFA

@@ -4,6 +4,10 @@
   Cada computador manda, a cada 5 minutos (tarefa agendada criada pelo instalar.ps1):
     hardware, uso de CPU/RAM/disco, rede (cabo ou Wi-Fi, sinal, velocidade), latencia ate o
     roteador e a internet, impressoras instaladas e antivirus.
+  Aviso de energia (desde a 2.7.0): tarefas do instalador rodam  svt-monitor.ps1 -Aviso desligando|suspendendo
+    quando o Windows comeca a desligar/suspender, para o portal diferenciar "desligado" de "sem rede". O relatorio
+    tambem leva os horarios de ligar, desligar, suspender e retomar (registro de eventos). Desliga com
+    "avisoDeEnergia": false no config.json.
   Sondagem da rede (desde a 2.6.0): rota (traceroute) ate a internet e ate aparelhos atras de outro roteador,
     latencia/perda/TTL ate os aparelhos que o portal indicar, servidor DHCP e DNS. So ICMP e leituras locais.
     Desliga com "sondagem": false no config.json.
@@ -26,11 +30,12 @@ param(
   [switch]$Teste,
   [switch]$Coletor,
   [string[]]$Redes,
-  [string]$Config = ''
+  [string]$Config = '',
+  [ValidateSet('', 'desligando', 'suspendendo')][string]$Aviso = ''
 )
 
 $ErrorActionPreference = 'Stop'
-$VERSAO = '2.6.0'
+$VERSAO = '2.7.0'
 # $PSScriptRoot fica vazio nos valores padrao do param() do PowerShell 5.1.
 $PASTA = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if (-not $Config) { $Config = Join-Path $PASTA 'config.json' }
@@ -51,11 +56,11 @@ function Arredondar($Valor, [int]$Casas = 1) { if ($null -eq $Valor) { return $n
 # ---------------------------------------------------------------- configuracao
 
 function Ler-Config {
-  $cfg = [ordered]@{ url = ''; token = ''; coletor = $false; redes = @(); snmpComunidade = 'public'; coletarUso = $true; diagnostico = $true; sondagem = $true }
+  $cfg = [ordered]@{ url = ''; token = ''; coletor = $false; redes = @(); snmpComunidade = 'public'; coletarUso = $true; diagnostico = $true; sondagem = $true; avisoDeEnergia = $true }
   if (Test-Path $Config) {
     try {
       $lido = Get-Content $Config -Raw -Encoding UTF8 | ConvertFrom-Json
-      foreach ($campo in @('url', 'token', 'coletor', 'redes', 'snmpComunidade', 'coletarUso', 'diagnostico', 'sondagem')) {
+      foreach ($campo in @('url', 'token', 'coletor', 'redes', 'snmpComunidade', 'coletarUso', 'diagnostico', 'sondagem', 'avisoDeEnergia')) {
         if ($null -ne $lido.$campo) { $cfg[$campo] = $lido.$campo }
       }
     } catch { Escrever-Log "config.json invalido: $($_.Exception.Message)" }
@@ -658,7 +663,12 @@ function Ler-EventosDoWindows([datetime]$Desde) {
     @{ Tipo = 'erro_disco'; Filtro = @{ LogName = 'System'; ProviderName = @('storahci', 'stornvme'); Id = 129 }; App = -1 },
     @{ Tipo = 'erro_hardware'; Filtro = @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WHEA-Logger'; Id = @(17, 18, 19, 20, 47) }; App = -1 },
     @{ Tipo = 'memoria_esgotada'; Filtro = @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Resource-Exhaustion-Detector'; Id = 2004 }; App = -1 },
-    @{ Tipo = 'driver_video'; Filtro = @{ LogName = 'System'; ProviderName = 'Display'; Id = 4101 }; App = -1 }
+    @{ Tipo = 'driver_video'; Filtro = @{ LogName = 'System'; ProviderName = 'Display'; Id = 4101 }; App = -1 },
+    # Liga e desliga: com os horarios o portal sabe se o computador ficou DESLIGADO, suspenso ou so sem rede.
+    @{ Tipo = 'ligou'; Filtro = @{ LogName = 'System'; ProviderName = 'EventLog'; Id = 6005 }; App = -1 },
+    @{ Tipo = 'desligou'; Filtro = @{ LogName = 'System'; ProviderName = 'EventLog'; Id = 6006 }; App = -1 },
+    @{ Tipo = 'suspendeu'; Filtro = @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 42 }; App = -1 },
+    @{ Tipo = 'retomou'; Filtro = @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Power-Troubleshooter'; Id = 1 }; App = -1 }
   )
   $itens = @()
   foreach ($c in $consultas) {
@@ -678,6 +688,8 @@ function Ler-EventosDoWindows([datetime]$Desde) {
         if ($c.App -ge 0 -and $e.Properties.Count -gt $c.App) { $app = Nome-SeguroDoApp $e.Properties[$c.App].Value }
         if ($tipo -eq 'reinicio') { $detalhe = Classificar-Reinicio ([string]$e.Properties[0].Value) $e.Properties[3].Value }
         elseif ($tipo -eq 'erro_disco' -or $tipo -eq 'erro_hardware') { $detalhe = '{0}:{1}' -f (Nome-SeguroDoApp $e.ProviderName), $e.Id }
+        # Liga/desliga/suspende/retoma: cada ocorrencia conta (nao se juntam), porque o que importa e a LINHA DO TEMPO.
+        elseif (@('ligou', 'desligou', 'suspendeu', 'retomou') -contains $tipo) { $detalhe = $e.TimeCreated.ToString('yyyyMMddHHmmss') }
       } catch {}
       $itens += [pscustomobject]@{ Tipo = $tipo; App = $app; Detalhe = $detalhe; Em = $e.TimeCreated }
     }
@@ -688,7 +700,11 @@ function Ler-EventosDoWindows([datetime]$Desde) {
   } else {
     foreach ($i in @($itens | Where-Object { $_.Tipo -eq 'desligamento_inesperado_6008' })) { $i.Tipo = 'desligamento_inesperado' }
   }
-  return @(Agrupar-Eventos $itens 30)
+  # A linha do tempo de energia tem limite proprio: um PC que dorme muitas vezes nao pode empurrar para fora os travamentos.
+  $energia = @('ligou', 'desligou', 'suspendeu', 'retomou')
+  $demais = @($itens | Where-Object { $energia -notcontains $_.Tipo })
+  $deEnergia = @($itens | Where-Object { $energia -contains $_.Tipo })
+  return @((Agrupar-Eventos $demais 30) + (Agrupar-Eventos $deEnergia 24))
 }
 
 function Ler-InicioDoWindows($Estado) {
@@ -961,6 +977,40 @@ function Medir-Sondagem($MeusIps = @()) {
   }
   $sond.duracaoSegundos = [math]::Round(((Get-Date) - $inicio).TotalSeconds, 1)
   return $sond
+}
+
+# ---------------------------------------------------------------- aviso de energia (desligando, suspendendo...)
+#
+# Sem isso, computador DESLIGADO e computador SEM REDE parecem iguais no portal: nenhum relatorio chega.
+# O instalador cria tarefas disparadas pelos eventos do Windows (desligar/reiniciar = User32 1074; entrar em
+# suspensao = Kernel-Power 42) que rodam  svt-monitor.ps1 -Aviso <estado>  : um POST minimo, so com o nome do
+# computador, o estado e a hora. Melhor esforco: queda de energia e tomada puxada nao avisam (ai o portal
+# diz "sem aviso"). Desliga com  "avisoDeEnergia": false  no config.json.
+
+function Classificar-Desligamento([string]$Tipo) {
+  # Evento 1074: o campo "tipo" vem no idioma do Windows ("Desligado", "Reiniciar", "restart", "power off").
+  if ($Tipo -match 'reinici|restart|reboot') { return 'reiniciando' }
+  return 'desligando'
+}
+
+function Ler-TipoDoDesligamento {
+  try {
+    $e = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'User32'; Id = 1074; StartTime = (Get-Date).AddMinutes(-3) } -MaxEvents 1 -ErrorAction Stop
+    return [string]$e.Properties[4].Value
+  } catch { return '' }
+}
+
+function Montar-Aviso([string]$Estado) {
+  return [ordered]@{ versao = $VERSAO; tipo = 'aviso'; nome = $env:COMPUTERNAME; estado = $Estado; em = (Iso (Get-Date)) }
+}
+
+function Enviar-Aviso([string]$Estado, $Cfg) {
+  $json = (Montar-Aviso $Estado) | ConvertTo-Json -Compress
+  if ($Teste) { Write-Output $json; return }
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+  # Curto de proposito: o Windows esta desligando e nao espera.
+  [void](Invoke-RestMethod -Method Post -Uri $Cfg.url -Body $bytes -ContentType 'application/json; charset=utf-8' -Headers @{ Authorization = "Bearer $($Cfg.token)" } -TimeoutSec 8)
+  Escrever-Log "Aviso enviado: $Estado"
 }
 
 # ---------------------------------------------------------------- varredura (computador coletor)
@@ -1245,6 +1295,14 @@ $cfg = Ler-Config
 if (-not $Teste -and (-not $cfg.url -or -not $cfg.token)) {
   Escrever-Log 'config.json sem url ou token: reinstale o agente pelo instalar.ps1.'
   exit 1
+}
+
+# Modo "aviso": so avisa o portal que o computador esta desligando/suspendendo e sai (nao mede nada).
+if ($Aviso) {
+  if ($cfg.avisoDeEnergia -ne $true) { exit 0 }
+  $estadoDoAviso = if ($Aviso -eq 'desligando') { Classificar-Desligamento (Ler-TipoDoDesligamento) } else { $Aviso }
+  try { Enviar-Aviso $estadoDoAviso $cfg } catch { Escrever-Log "Falha no aviso de energia: $($_.Exception.Message)" }
+  exit 0
 }
 
 try {

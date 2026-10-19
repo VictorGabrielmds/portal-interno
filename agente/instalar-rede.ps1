@@ -10,6 +10,7 @@ param(
   [switch]$Coletor,
   [switch]$SemDiagnostico,
   [switch]$SemSondagem,
+  [switch]$SemAviso,
   [string[]]$Redes = @(),
   [string]$Comunidade = 'public',
   [string]$Origem = 'https://portal.svtfaculdade.edu.br/agente'
@@ -19,7 +20,7 @@ $instalador = Join-Path $env:TEMP ('svt-inventario-' + [Guid]::NewGuid().ToStrin
 try {
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
   Invoke-WebRequest -Uri "$Origem/instalar.ps1" -OutFile $instalador -UseBasicParsing
-  & $instalador -Token $Token -Url $Url -Coletor:$Coletor -Redes $Redes -Comunidade $Comunidade -Origem $Origem -SemUso -SemDiagnostico:$SemDiagnostico -SemSondagem:$SemSondagem
+  & $instalador -Token $Token -Url $Url -Coletor:$Coletor -Redes $Redes -Comunidade $Comunidade -Origem $Origem -SemUso -SemDiagnostico:$SemDiagnostico -SemSondagem:$SemSondagem -SemAviso:$SemAviso
 } finally {
   Remove-Item -LiteralPath $instalador -Force -ErrorAction SilentlyContinue
 }
