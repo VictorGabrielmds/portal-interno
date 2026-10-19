@@ -4,6 +4,9 @@
   Cada computador manda, a cada 5 minutos (tarefa agendada criada pelo instalar.ps1):
     hardware, uso de CPU/RAM/disco, rede (cabo ou Wi-Fi, sinal, velocidade), latencia ate o
     roteador e a internet, impressoras instaladas e antivirus.
+  Sondagem da rede (desde a 2.6.0): rota (traceroute) ate a internet e ate aparelhos atras de outro roteador,
+    latencia/perda/TTL ate os aparelhos que o portal indicar, servidor DHCP e DNS. So ICMP e leituras locais.
+    Desliga com "sondagem": false no config.json.
   Diagnostico (desde a 2.5.0): rajada de desempenho (CPU, disco, memoria), NOMES dos programas que
     mais pesam e eventos do Windows (programa que travou ou fechou, desligamento inesperado, erro de
     disco). Nunca titulo de janela, caminho, linha de comando, usuario ou conteudo. Desliga com
@@ -27,7 +30,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$VERSAO = '2.5.0'
+$VERSAO = '2.6.0'
 # $PSScriptRoot fica vazio nos valores padrao do param() do PowerShell 5.1.
 $PASTA = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if (-not $Config) { $Config = Join-Path $PASTA 'config.json' }
@@ -48,11 +51,11 @@ function Arredondar($Valor, [int]$Casas = 1) { if ($null -eq $Valor) { return $n
 # ---------------------------------------------------------------- configuracao
 
 function Ler-Config {
-  $cfg = [ordered]@{ url = ''; token = ''; coletor = $false; redes = @(); snmpComunidade = 'public'; coletarUso = $true; diagnostico = $true }
+  $cfg = [ordered]@{ url = ''; token = ''; coletor = $false; redes = @(); snmpComunidade = 'public'; coletarUso = $true; diagnostico = $true; sondagem = $true }
   if (Test-Path $Config) {
     try {
       $lido = Get-Content $Config -Raw -Encoding UTF8 | ConvertFrom-Json
-      foreach ($campo in @('url', 'token', 'coletor', 'redes', 'snmpComunidade', 'coletarUso', 'diagnostico')) {
+      foreach ($campo in @('url', 'token', 'coletor', 'redes', 'snmpComunidade', 'coletarUso', 'diagnostico', 'sondagem')) {
         if ($null -ne $lido.$campo) { $cfg[$campo] = $lido.$campo }
       }
     } catch { Escrever-Log "config.json invalido: $($_.Exception.Message)" }
@@ -394,6 +397,12 @@ function Montar-RelatorioPc($Cfg = $null) {
     try { $diagnostico = Ler-Diagnostico ([int](($cpu | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum)) }
     catch { Escrever-Log "Falha no diagnostico: $($_.Exception.Message)" }
   }
+  # Sondagem da rede (rota ate a internet, latencia e saltos ate os aparelhos): desliga com "sondagem": false.
+  $sondagem = $null
+  if ($Cfg -and $Cfg.sondagem -eq $true) {
+    try { $sondagem = Medir-Sondagem @($adaptadores | ForEach-Object { $_.ipv4 }) }
+    catch { Escrever-Log "Falha na sondagem da rede: $($_.Exception.Message)" }
+  }
   return [ordered]@{
     versao = $VERSAO
     tipo   = 'pc'
@@ -441,6 +450,7 @@ function Montar-RelatorioPc($Cfg = $null) {
       seguranca     = [ordered]@{ antivirus = @(Ler-Antivirus) }
       uptimeSegundos = [int]((Get-Date) - $so.LastBootUpTime).TotalSeconds
       diagnostico    = $diagnostico
+      sondagem       = $sondagem
     }
   }
 }
@@ -753,6 +763,206 @@ function Ler-Diagnostico([int]$Nucleos) {
   return $diag
 }
 
+# ---------------------------------------------------------------- sondagem da rede (caminhos, saltos e latencia)
+#
+# Cada computador mede a rede do ponto de vista dele, para o portal descobrir como os aparelhos estao
+# alocados (atras de qual roteador, qual e o modem, onde a internet fica lenta):
+#   - rota ate a internet (traceroute com todos os TTL ao mesmo tempo, 3 rodadas): cada salto com o IP,
+#     o tempo (mediana) e a perda;
+#   - latencia, perda e TTL de resposta ate os aparelhos da rede que o portal mandar (ate 48 enderecos);
+#     o TTL diz quantos roteadores existem no meio (TTL 64/128/255 menos o recebido);
+#   - rota ate os aparelhos que estao atras de outro roteador (ate 3);
+#   - servidor DHCP e servidores DNS deste computador.
+# So pings (ICMP) e consultas locais: nada de conteudo, nome de usuario ou varredura de portas.
+# Desliga com  "sondagem": false  no config.json.
+
+$ARQUIVO_ALVOS_SONDAGEM = Join-Path $PASTA 'sondagem-alvos.json'
+$ALVO_INTERNET = '8.8.8.8'
+
+function Ip-EhPrivado([string]$Ip) {
+  $partes = ([string]$Ip).Split('.')
+  if ($partes.Count -ne 4) { return $false }
+  $a = 0; $b = 0
+  if (-not [int]::TryParse($partes[0], [ref]$a) -or -not [int]::TryParse($partes[1], [ref]$b)) { return $false }
+  if ($a -eq 10) { return $true }
+  if ($a -eq 172 -and $b -ge 16 -and $b -le 31) { return $true }
+  if ($a -eq 192 -and $b -eq 168) { return $true }
+  if ($a -eq 100 -and $b -ge 64 -and $b -le 127) { return $true }   # CGNAT do provedor
+  if ($a -eq 169 -and $b -eq 254) { return $true }
+  return $false
+}
+
+function Estimar-Saltos($Ttl) {
+  # TTL recebido numa resposta -> quantos roteadores ficaram no meio (TTL inicial 64, 128 ou 255).
+  $t = 0
+  if (-not [int]::TryParse([string]$Ttl, [ref]$t) -or $t -le 0) { return $null }
+  $inicial = if ($t -le 64) { 64 } elseif ($t -le 128) { 128 } else { 255 }
+  return ($inicial - $t)
+}
+
+function Mediana-De($Valores) {
+  $lista = @($Valores | Where-Object { $null -ne $_ } | Sort-Object)
+  if (-not $lista.Count) { return $null }
+  $meio = [int][math]::Floor($lista.Count / 2)
+  if ($lista.Count % 2) { return [double]$lista[$meio] }
+  return ([double]$lista[$meio - 1] + [double]$lista[$meio]) / 2
+}
+
+function Resumir-Saltos($Amostras, [int]$Rodadas) {
+  # $Amostras: objetos { Ttl; Ip; Ms; Chegou } (uma por resposta recebida). Devolve os saltos ate o destino:
+  # por TTL, o IP que mais respondeu, o tempo (mediana) e a perda. Depois do destino nada vale.
+  if ($Rodadas -lt 1) { $Rodadas = 1 }
+  $amostras = @($Amostras | Where-Object { $_ })
+  $chegada = @($amostras | Where-Object { $_.Chegou } | ForEach-Object { [int]$_.Ttl })
+  $ultimo = 0
+  if ($amostras.Count) { $ultimo = ($amostras | ForEach-Object { [int]$_.Ttl } | Measure-Object -Maximum).Maximum }
+  if ($chegada.Count) { $ultimo = ($chegada | Measure-Object -Minimum).Minimum }
+  $saltos = @()
+  for ($ttl = 1; $ttl -le $ultimo; $ttl++) {
+    $doSalto = @($amostras | Where-Object { [int]$_.Ttl -eq $ttl -and $_.Ip })
+    $ip = ''
+    $ms = $null
+    if ($doSalto.Count) {
+      $ip = ($doSalto | Group-Object Ip | Sort-Object Count -Descending | Select-Object -First 1).Name
+      $ms = Mediana-De @($doSalto | Where-Object { $_.Ip -eq $ip } | ForEach-Object { $_.Ms })
+    }
+    $perda = [int][math]::Round(100 * ($Rodadas - [math]::Min($Rodadas, $doSalto.Count)) / $Rodadas)
+    $saltos += [ordered]@{ n = $ttl; ip = $ip; ms = $(if ($null -ne $ms) { [math]::Round($ms, 1) } else { $null }); perda = $perda }
+  }
+  # Saltos finais mudos (sem resposta e antes de chegar) nao dizem nada: tira.
+  while ($saltos.Count -and -not $saltos[$saltos.Count - 1].ip) { $saltos = @($saltos | Select-Object -First ($saltos.Count - 1)) }
+  return [pscustomobject]@{ chegou = ($chegada.Count -gt 0); saltos = @($saltos) }
+}
+
+function Rastrear-Rota([string]$Destino, [int]$MaxSaltos = 16, [int]$Rodadas = 3, [int]$TimeoutMs = 1200) {
+  # Traceroute com todos os TTL ao mesmo tempo (uma rodada leva ~1 s, nao 1 s por salto).
+  $buffer = [byte[]](97..(97 + 31))
+  $coletadas = @()
+  for ($r = 0; $r -lt $Rodadas; $r++) {
+    $envios = @()
+    for ($ttl = 1; $ttl -le $MaxSaltos; $ttl++) {
+      $ping = New-Object System.Net.NetworkInformation.Ping
+      $opcoes = New-Object System.Net.NetworkInformation.PingOptions($ttl, $true)
+      try { $envios += [pscustomobject]@{ Ttl = $ttl; Ping = $ping; Tarefa = $ping.SendPingAsync($Destino, $TimeoutMs, $buffer, $opcoes) } } catch { $ping.Dispose() }
+    }
+    try { [void][System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($envios | ForEach-Object { $_.Tarefa }), $TimeoutMs + 2000) } catch {}
+    foreach ($e in $envios) {
+      try {
+        if ($e.Tarefa.Status -eq 'RanToCompletion') {
+          $resp = $e.Tarefa.Result
+          $estadoResp = [string]$resp.Status
+          if (($estadoResp -eq 'TtlExpired' -or $estadoResp -eq 'Success') -and $resp.Address) {
+            $coletadas += [pscustomobject]@{ Ttl = $e.Ttl; Ip = $resp.Address.ToString(); Ms = [double]$resp.RoundtripTime; Chegou = ($estadoResp -eq 'Success') }
+          }
+        }
+      } catch {}
+      $e.Ping.Dispose()
+    }
+    if ($r -lt $Rodadas - 1) { Start-Sleep -Milliseconds 150 }
+  }
+  return Resumir-Saltos $coletadas $Rodadas
+}
+
+function Resumir-Alvo([string]$Ip, $Medidas, [int]$Tentativas) {
+  # $Medidas: objetos { Ms; Ttl } das respostas recebidas.
+  $m = @($Medidas | Where-Object { $_ })
+  if (-not $m.Count) { return [ordered]@{ ip = $Ip; ms = $null; min = $null; max = $null; perda = 100; ttl = $null; saltos = $null } }
+  $tempos = @($m | ForEach-Object { [double]$_.Ms })
+  $ttls = @($m | Where-Object { $_.Ttl } | ForEach-Object { [int]$_.Ttl })
+  $ttl = if ($ttls.Count) { ($ttls | Measure-Object -Minimum).Minimum } else { $null }
+  return [ordered]@{
+    ip     = $Ip
+    ms     = [math]::Round((Mediana-De $tempos), 1)
+    min    = [math]::Round(($tempos | Measure-Object -Minimum).Minimum, 1)
+    max    = [math]::Round(($tempos | Measure-Object -Maximum).Maximum, 1)
+    perda  = [int][math]::Round(100 * ($Tentativas - [math]::Min($Tentativas, $m.Count)) / [math]::Max(1, $Tentativas))
+    ttl    = $ttl
+    saltos = (Estimar-Saltos $ttl)
+  }
+}
+
+function Sondar-Alvos([string[]]$Ips, [int]$Tentativas = 4, [int]$TimeoutMs = 900) {
+  # Latencia, perda e TTL ate cada endereco, todos ao mesmo tempo, em algumas rodadas.
+  $Ips = @($Ips | Where-Object { $_ } | Select-Object -Unique)
+  if (-not $Ips.Count) { return @() }
+  $medidas = @{}
+  foreach ($ip in $Ips) { $medidas[$ip] = New-Object System.Collections.ArrayList }
+  for ($r = 0; $r -lt $Tentativas; $r++) {
+    $envios = @()
+    foreach ($ip in $Ips) {
+      $ping = New-Object System.Net.NetworkInformation.Ping
+      try { $envios += [pscustomobject]@{ Ip = $ip; Ping = $ping; Tarefa = $ping.SendPingAsync($ip, $TimeoutMs) } } catch { $ping.Dispose() }
+    }
+    try { [void][System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($envios | ForEach-Object { $_.Tarefa }), $TimeoutMs + 2000) } catch {}
+    foreach ($e in $envios) {
+      try {
+        if ($e.Tarefa.Status -eq 'RanToCompletion' -and [string]$e.Tarefa.Result.Status -eq 'Success') {
+          $ttl = $null
+          try { if ($e.Tarefa.Result.Options) { $ttl = [int]$e.Tarefa.Result.Options.Ttl } } catch {}
+          [void]$medidas[$e.Ip].Add([pscustomobject]@{ Ms = [double]$e.Tarefa.Result.RoundtripTime; Ttl = $ttl })
+        }
+      } catch {}
+      $e.Ping.Dispose()
+    }
+    if ($r -lt $Tentativas - 1) { Start-Sleep -Milliseconds 150 }
+  }
+  return @($Ips | ForEach-Object { Resumir-Alvo $_ @($medidas[$_]) $Tentativas })
+}
+
+function Ler-DhcpDns {
+  # Servidor DHCP e DNS do adaptador que tem o gateway. So leitura local.
+  try {
+    $configs = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=true' -ErrorAction Stop | Where-Object { $_.DefaultIPGateway })
+    $c = $configs | Select-Object -First 1
+    if (-not $c) { return $null }
+    return [ordered]@{ servidor = [string]$c.DHCPServer; dns = @($c.DNSServerSearchOrder | Where-Object { $_ } | Select-Object -First 4) }
+  } catch { return $null }
+}
+
+function Ler-AlvosDaSondagem {
+  if (-not (Test-Path $ARQUIVO_ALVOS_SONDAGEM)) { return @() }
+  try {
+    $lido = Get-Content $ARQUIVO_ALVOS_SONDAGEM -Raw -Encoding UTF8 | ConvertFrom-Json
+    return @($lido.alvos | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } | Select-Object -First 48)
+  } catch { return @() }
+}
+
+function Guardar-AlvosDaSondagem($Sondagem) {
+  # O portal manda a lista de aparelhos a medir (ate 48 enderecos); fica para a proxima rodada.
+  if (-not $Sondagem -or $null -eq $Sondagem.alvos) { return }
+  try {
+    $alvos = @($Sondagem.alvos | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } | Select-Object -First 48)
+    [System.IO.File]::WriteAllText($ARQUIVO_ALVOS_SONDAGEM, (@{ alvos = $alvos } | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+  } catch { Escrever-Log "Nao consegui gravar sondagem-alvos.json: $($_.Exception.Message)" }
+}
+
+function Medir-Sondagem($MeusIps = @()) {
+  $inicio = Get-Date
+  $sond = [ordered]@{ versao = 1; coletadoEm = (Iso $inicio) }
+  try {
+    $rota = Rastrear-Rota $ALVO_INTERNET 16 3 1200
+    $sond.internet = [ordered]@{ alvo = $ALVO_INTERNET; chegou = [bool]$rota.chegou; saltos = @($rota.saltos) }
+  } catch { Escrever-Log "Sondagem: rota ate a internet indisponivel ($($_.Exception.Message))" }
+  $dhcp = Ler-DhcpDns
+  if ($dhcp) { $sond.dhcp = $dhcp }
+  $alvos = @(Ler-AlvosDaSondagem | Where-Object { $MeusIps -notcontains $_ })
+  if ($alvos.Count) {
+    try {
+      $sond.alvos = @(Sondar-Alvos $alvos 4 900)
+      # Aparelho que respondeu com TTL menor que o inicial esta atras de outro roteador: descobre o caminho (ate 3).
+      $atras = @($sond.alvos | Where-Object { $_.saltos -ge 1 -and (Ip-EhPrivado $_.ip) } | Sort-Object @{ Expression = { $_.saltos }; Descending = $true }, @{ Expression = { $_.ip }; Descending = $false } | Select-Object -First 3)
+      $rotas = @()
+      foreach ($a in $atras) {
+        $r = Rastrear-Rota $a.ip 10 2 900
+        $rotas += [ordered]@{ alvo = $a.ip; chegou = [bool]$r.chegou; saltos = @($r.saltos) }
+      }
+      if ($rotas.Count) { $sond.rotas = $rotas }
+    } catch { Escrever-Log "Sondagem: aparelhos indisponiveis ($($_.Exception.Message))" }
+  }
+  $sond.duracaoSegundos = [math]::Round(((Get-Date) - $inicio).TotalSeconds, 1)
+  return $sond
+}
+
 # ---------------------------------------------------------------- varredura (computador coletor)
 
 $PORTAS = @(21, 22, 23, 53, 80, 135, 139, 443, 445, 515, 554, 631, 3389, 8080, 9100)
@@ -1043,6 +1253,7 @@ try {
   # So avanca a janela dos eventos depois que o portal confirmou o envio (senao a proxima rodada repete).
   if (-not $Teste -and $resposta -and $resposta.historicoGravado -eq $true -and $script:EstadoDiagnosticoNovo) { Gravar-EstadoDiagnostico $script:EstadoDiagnosticoNovo }
   if ($cfg.coletarUso -eq $true -and $resposta -and $resposta.vigilancia) { Guardar-SitesVigiados $resposta.vigilancia }
+  if (-not $Teste -and $cfg.sondagem -eq $true -and $resposta -and $resposta.sondagem) { Guardar-AlvosDaSondagem $resposta.sondagem }
 }
 catch { Escrever-Log "Falha no relatorio do computador: $($_.Exception.Message)" }
 
