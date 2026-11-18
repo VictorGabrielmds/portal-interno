@@ -35,7 +35,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$VERSAO = '2.7.0'
+$VERSAO = '2.8.0'
 # $PSScriptRoot fica vazio nos valores padrao do param() do PowerShell 5.1.
 $PASTA = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if (-not $Config) { $Config = Join-Path $PASTA 'config.json' }
@@ -56,11 +56,11 @@ function Arredondar($Valor, [int]$Casas = 1) { if ($null -eq $Valor) { return $n
 # ---------------------------------------------------------------- configuracao
 
 function Ler-Config {
-  $cfg = [ordered]@{ url = ''; token = ''; coletor = $false; redes = @(); snmpComunidade = 'public'; coletarUso = $true; diagnostico = $true; sondagem = $true; avisoDeEnergia = $true }
+  $cfg = [ordered]@{ url = ''; token = ''; coletor = $false; redes = @(); snmpComunidade = 'public'; coletarUso = $true; diagnostico = $true; sondagem = $true; avisoDeEnergia = $true; modems = $true }
   if (Test-Path $Config) {
     try {
       $lido = Get-Content $Config -Raw -Encoding UTF8 | ConvertFrom-Json
-      foreach ($campo in @('url', 'token', 'coletor', 'redes', 'snmpComunidade', 'coletarUso', 'diagnostico', 'sondagem', 'avisoDeEnergia')) {
+      foreach ($campo in @('url', 'token', 'coletor', 'redes', 'snmpComunidade', 'coletarUso', 'diagnostico', 'sondagem', 'avisoDeEnergia', 'modems')) {
         if ($null -ne $lido.$campo) { $cfg[$campo] = $lido.$campo }
       }
     } catch { Escrever-Log "config.json invalido: $($_.Exception.Message)" }
@@ -408,6 +408,7 @@ function Montar-RelatorioPc($Cfg = $null) {
     try { $sondagem = Medir-Sondagem @($adaptadores | ForEach-Object { $_.ipv4 }) }
     catch { Escrever-Log "Falha na sondagem da rede: $($_.Exception.Message)" }
   }
+  $script:UltimaSondagem = $sondagem   # o coletor usa a rota para achar o modem em uso
   return [ordered]@{
     versao = $VERSAO
     tipo   = 'pc'
@@ -1013,6 +1014,201 @@ function Enviar-Aviso([string]$Estado, $Cfg) {
   Escrever-Log "Aviso enviado: $Estado"
 }
 
+# ---------------------------------------------------------------- modems das internets (UPnP, so leitura)
+#
+# Os modems ficam do lado de fora do firewall: a varredura nao os enxerga. Muitos modems de provedor respondem ao
+# UPnP (o mesmo padrao que consoles e programas usam): sem senha, eles dizem se estao conectados a operadora, ha
+# quanto tempo, o IP publico, o estado do link, o trafego e as portas que algum aparelho abriu neles. So o coletor
+# pergunta, a cada rodada, aos modems que o portal manda (os IPs anotados nas internets) e ao modem que aparece na
+# rota. So as acoes de LEITURA do padrao (lista abaixo): nada e alterado no modem. Desliga com "modems": false.
+
+$ARQUIVO_MODEMS = Join-Path $PASTA 'modems.json'
+$ACOES_UPNP_DE_LEITURA = @('GetStatusInfo', 'GetExternalIPAddress', 'GetCommonLinkProperties', 'GetTotalBytesSent', 'GetTotalBytesReceived', 'GetGenericPortMappingEntry')
+
+function Numero-OuNulo($Valor) {
+  $n = 0.0
+  if ([double]::TryParse([string]$Valor, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { return $n }
+  return $null
+}
+
+function Ler-XmlSeguro([string]$Texto) {
+  # Sem DTD e sem buscar nada de fora (XML que vem do modem nao e confiavel).
+  $opcoes = New-Object System.Xml.XmlReaderSettings
+  $opcoes.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+  $opcoes.XmlResolver = $null
+  $leitor = [System.Xml.XmlReader]::Create((New-Object System.IO.StringReader($Texto)), $opcoes)
+  try {
+    $doc = New-Object System.Xml.XmlDocument
+    $doc.XmlResolver = $null
+    $doc.Load($leitor)
+    return $doc
+  } finally { $leitor.Close() }
+}
+
+function Ler-ModemsAnotados {
+  if (-not (Test-Path $ARQUIVO_MODEMS)) { return @() }
+  try {
+    $lido = Get-Content $ARQUIVO_MODEMS -Raw -Encoding UTF8 | ConvertFrom-Json
+    return @($lido.modems | Where-Object { Ip-EhPrivado $_ } | Select-Object -First 4)
+  } catch { return @() }
+}
+
+function Guardar-ModemsAnotados($Lista) {
+  # O portal manda os IPs dos modems anotados nas internets; ficam para a proxima rodada.
+  try {
+    $modems = @($Lista | Where-Object { Ip-EhPrivado $_ } | Select-Object -First 4)
+    [System.IO.File]::WriteAllText($ARQUIVO_MODEMS, (@{ modems = $modems } | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+  } catch { Escrever-Log "Nao consegui gravar modems.json: $($_.Exception.Message)" }
+}
+
+function Modems-ParaLer($Anotados, $Sondagem) {
+  # Os anotados no portal e o modem que a rota enxerga agora (o primeiro endereco privado depois do gateway).
+  $lista = @($Anotados | Where-Object { Ip-EhPrivado $_ })
+  $privados = @($Sondagem.internet.saltos | Where-Object { $_.ip -and (Ip-EhPrivado $_.ip) } | Sort-Object { [int]$_.n } | ForEach-Object { [string]$_.ip })
+  if ($privados.Count -ge 2) { $lista += $privados[1] }
+  return @($lista | Select-Object -Unique | Select-Object -First 4)
+}
+
+function Local-DoSsdp([string]$Resposta, [string]$Ip) {
+  # Endereco da descricao do aparelho, so se apontar para o proprio modem que perguntamos.
+  $m = [regex]::Match($Resposta, '(?im)^LOCATION:\s*(http://([0-9.]+):(\d{1,5})(/[^\s]*)?)\s*$')
+  if (-not $m.Success -or $m.Groups[2].Value -ne $Ip) { return $null }
+  return $m.Groups[1].Value
+}
+
+function Buscar-Upnp([string]$Ip, [int]$TimeoutMs = 2500) {
+  # Pergunta (SSDP direto ao modem, sem multicast) onde fica a descricao do roteador de internet.
+  $udp = New-Object System.Net.Sockets.UdpClient
+  try {
+    $udp.Client.ReceiveTimeout = $TimeoutMs
+    $msg = "M-SEARCH * HTTP/1.1`r`nHOST: ${Ip}:1900`r`nMAN: `"ssdp:discover`"`r`nMX: 2`r`nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1`r`n`r`n"
+    $bytes = [Text.Encoding]::ASCII.GetBytes($msg)
+    [void]$udp.Send($bytes, $bytes.Length, $Ip, 1900)
+    $fim = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $fim) {
+      $remoto = New-Object System.Net.IPEndPoint([Net.IPAddress]::Any, 0)
+      $resposta = $null
+      try { $resposta = [Text.Encoding]::ASCII.GetString($udp.Receive([ref]$remoto)) } catch { break }
+      $local = Local-DoSsdp $resposta $Ip
+      if ($local) { return $local }
+    }
+  } finally { $udp.Close() }
+  return $null
+}
+
+function Ler-DescricaoUpnp([string]$Xml, [string]$Base) {
+  # Fabricante, modelo e onde ficam os servicos de WAN. $Base = http://IP:porta (os servicos tem de ser do proprio modem).
+  $doc = Ler-XmlSeguro $Xml
+  $valor = { param($no, $campo) $c = $no.SelectSingleNode("*[local-name()='$campo']"); if ($c) { ([string]$c.InnerText).Trim() } else { '' } }
+  $aparelho = $doc.SelectSingleNode("//*[local-name()='device']")
+  $info = [ordered]@{ fabricante = ''; modelo = ''; numero = ''; conexao = $null; comum = $null }
+  if ($aparelho) {
+    $info.fabricante = & $valor $aparelho 'manufacturer'
+    $info.modelo = & $valor $aparelho 'modelName'
+    $info.numero = & $valor $aparelho 'modelNumber'
+  }
+  foreach ($s in @($doc.SelectNodes("//*[local-name()='service']"))) {
+    $tipo = & $valor $s 'serviceType'
+    $url = & $valor $s 'controlURL'
+    if ($url -match '^/') { $url = "$Base$url" }
+    elseif (-not $url.StartsWith("$Base/")) { continue }
+    if (-not $info.conexao -and $tipo -match '^urn:schemas-upnp-org:service:WAN(IP|PPP)Connection:\d+$') { $info.conexao = [ordered]@{ tipo = $tipo; url = $url } }
+    if (-not $info.comum -and $tipo -match '^urn:schemas-upnp-org:service:WANCommonInterfaceConfig:\d+$') { $info.comum = [ordered]@{ tipo = $tipo; url = $url } }
+  }
+  return $info
+}
+
+function Ler-RespostaSoap([string]$Xml) {
+  $doc = Ler-XmlSeguro $Xml
+  $resposta = $doc.SelectSingleNode("//*[local-name()='Body']/*[1]")
+  $saida = @{}
+  if ($resposta) { foreach ($c in @($resposta.ChildNodes)) { if ($c.NodeType -eq [System.Xml.XmlNodeType]::Element) { $saida[$c.LocalName] = ([string]$c.InnerText).Trim() } } }
+  return $saida
+}
+
+function Pedir-Soap([string]$Url, [string]$Servico, [string]$Acao, [hashtable]$Argumentos = @{}, [int]$TimeoutSec = 5) {
+  if ($ACOES_UPNP_DE_LEITURA -notcontains $Acao) { throw "Acao UPnP nao permitida: $Acao" }
+  $campos = ($Argumentos.Keys | ForEach-Object { "<$_>$([Security.SecurityElement]::Escape([string]$Argumentos[$_]))</$_>" }) -join ''
+  $corpo = "<?xml version=`"1.0`"?><s:Envelope xmlns:s=`"http://schemas.xmlsoap.org/soap/envelope/`" s:encodingStyle=`"http://schemas.xmlsoap.org/soap/encoding/`"><s:Body><u:$Acao xmlns:u=`"$Servico`">$campos</u:$Acao></s:Body></s:Envelope>"
+  $r = Invoke-WebRequest -Uri $Url -Method Post -Body $corpo -ContentType 'text/xml; charset="utf-8"' -Headers @{ SOAPAction = "`"$Servico#$Acao`"" } -UseBasicParsing -TimeoutSec $TimeoutSec -MaximumRedirection 0
+  return Ler-RespostaSoap $r.Content
+}
+
+function Diferenca-Contador($Antes, $Depois) {
+  # Os contadores do UPnP tem 32 bits: passam de 4.294.967.295 e voltam a zero.
+  if ($null -eq $Antes -or $null -eq $Depois) { return $null }
+  if ($Depois -ge $Antes) { return $Depois - $Antes }
+  if ($Antes -lt 4294967296) { return $Depois + 4294967296 - $Antes }
+  return $null
+}
+
+function Ler-Bytes($Comum) {
+  $enviados = Numero-OuNulo (Pedir-Soap $Comum.url $Comum.tipo 'GetTotalBytesSent').NewTotalBytesSent
+  $recebidos = Numero-OuNulo (Pedir-Soap $Comum.url $Comum.tipo 'GetTotalBytesReceived').NewTotalBytesReceived
+  return [ordered]@{ enviados = $enviados; recebidos = $recebidos; em = Get-Date }
+}
+
+function Ler-ModemUpnp([string]$Ip, [int]$JanelaTrafegoSegundos = 10) {
+  $modem = [ordered]@{ ip = $Ip; medidoEm = (Iso (Get-Date)); upnp = $false }
+  $local = Buscar-Upnp $Ip
+  if (-not $local) { $modem.motivo = 'sem_resposta'; return $modem }
+  $base = ([regex]::Match($local, '^http://[0-9.]+:\d+')).Value
+  try {
+    $descricao = Invoke-WebRequest -Uri $local -UseBasicParsing -TimeoutSec 5 -MaximumRedirection 0
+    $info = Ler-DescricaoUpnp $descricao.Content $base
+  } catch { $modem.motivo = 'descricao_falhou'; return $modem }
+  $modem.upnp = $true
+  $modem.fabricante = $info.fabricante
+  $modem.modelo = $info.modelo
+  if ($info.numero -and $info.numero -ne $info.modelo -and $info.numero.Length -gt 1) { $modem.numeroDoModelo = $info.numero }
+  if ($info.conexao) {
+    try {
+      $s = Pedir-Soap $info.conexao.url $info.conexao.tipo 'GetStatusInfo'
+      $modem.conexao = [ordered]@{ status = $s.NewConnectionStatus; erro = $s.NewLastConnectionError; uptimeSegundos = Numero-OuNulo $s.NewUptime }
+    } catch {}
+    try { $modem.ipPublico = (Pedir-Soap $info.conexao.url $info.conexao.tipo 'GetExternalIPAddress').NewExternalIPAddress } catch {}
+    # Portas que algum aparelho abriu no modem pelo UPnP (console, camera, programa): ate 32.
+    $portas = @()
+    for ($i = 0; $i -lt 32; $i++) {
+      $p = $null
+      try { $p = Pedir-Soap $info.conexao.url $info.conexao.tipo 'GetGenericPortMappingEntry' @{ NewPortMappingIndex = $i } 3 } catch { break }
+      if (-not $p.NewExternalPort) { break }
+      $portas += [ordered]@{ protocolo = $p.NewProtocol; externa = Numero-OuNulo $p.NewExternalPort; interno = $p.NewInternalClient; interna = Numero-OuNulo $p.NewInternalPort; descricao = $p.NewPortMappingDescription; ativa = ($p.NewEnabled -in @('1', 'true')) }
+    }
+    $modem.portas = $portas
+  }
+  if ($info.comum) {
+    try {
+      $l = Pedir-Soap $info.comum.url $info.comum.tipo 'GetCommonLinkProperties'
+      $modem.link = [ordered]@{ status = $l.NewPhysicalLinkStatus; tipo = $l.NewWANAccessType; maxDownBps = Numero-OuNulo $l.NewLayer1DownstreamMaxBitRate; maxUpBps = Numero-OuNulo $l.NewLayer1UpstreamMaxBitRate }
+    } catch {}
+    # Trafego de agora: duas leituras dos contadores com alguns segundos entre elas.
+    try {
+      $antes = Ler-Bytes $info.comum
+      Start-Sleep -Seconds $JanelaTrafegoSegundos
+      $depois = Ler-Bytes $info.comum
+      $segundos = ($depois.em - $antes.em).TotalSeconds
+      $modem.bytes = [ordered]@{ enviados = $depois.enviados; recebidos = $depois.recebidos }
+      $subiu = Diferenca-Contador $antes.enviados $depois.enviados
+      $desceu = Diferenca-Contador $antes.recebidos $depois.recebidos
+      if ($segundos -gt 0 -and $null -ne $subiu -and $null -ne $desceu) {
+        $modem.trafego = [ordered]@{ downBps = [math]::Round($desceu * 8 / $segundos); upBps = [math]::Round($subiu * 8 / $segundos); janelaSegundos = [math]::Round($segundos, 1) }
+      }
+    } catch {}
+  }
+  return $modem
+}
+
+function Ler-Modems($Cfg) {
+  if ($Cfg.modems -eq $false) { return @() }
+  $lidos = @()
+  foreach ($ip in @(Modems-ParaLer (Ler-ModemsAnotados) $script:UltimaSondagem)) {
+    try { $lidos += Ler-ModemUpnp $ip }
+    catch { Escrever-Log "Modem ${ip}: $($_.Exception.Message)"; $lidos += [ordered]@{ ip = $ip; medidoEm = (Iso (Get-Date)); upnp = $false; motivo = 'falhou' } }
+  }
+  return $lidos
+}
+
 # ---------------------------------------------------------------- varredura (computador coletor)
 
 $PORTAS = @(21, 22, 23, 53, 80, 135, 139, 443, 445, 515, 554, 631, 3389, 8080, 9100)
@@ -1196,6 +1392,8 @@ function Montar-Varredura($Cfg) {
   try { $ipPublico = (Invoke-RestMethod -Uri 'https://api.ipify.org?format=json' -TimeoutSec 6).ip } catch {}
   $latGateway = $null
   if ($gateway) { $latGateway = (Medir-Latencia $gateway 3).latenciaMs }
+  $modems = @()
+  try { $modems = @(Ler-Modems $Cfg) } catch { Escrever-Log "Falha ao ler os modems: $($_.Exception.Message)" }
 
   return [ordered]@{
     versao       = $VERSAO
@@ -1217,6 +1415,7 @@ function Montar-Varredura($Cfg) {
       latenciaGatewayMs = $latGateway
     }
     dispositivos = @($dispositivos)
+    modems       = @($modems)
   }
 }
 
@@ -1316,6 +1515,10 @@ try {
 catch { Escrever-Log "Falha no relatorio do computador: $($_.Exception.Message)" }
 
 if ($cfg.coletor) {
-  try { Enviar (Montar-Varredura $cfg) $cfg }
+  try {
+    $respostaRede = Enviar (Montar-Varredura $cfg) $cfg
+    if ($Teste -and $respostaRede) { Write-Output $respostaRede }
+    if (-not $Teste -and $respostaRede -and $null -ne $respostaRede.modems) { Guardar-ModemsAnotados $respostaRede.modems }
+  }
   catch { Escrever-Log "Falha na varredura da rede: $($_.Exception.Message)" }
 }
