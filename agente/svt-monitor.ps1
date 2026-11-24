@@ -35,7 +35,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$VERSAO = '2.8.0'
+$VERSAO = '2.9.0'
 # $PSScriptRoot fica vazio nos valores padrao do param() do PowerShell 5.1.
 $PASTA = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 if (-not $Config) { $Config = Join-Path $PASTA 'config.json' }
@@ -358,6 +358,154 @@ function Ler-Antivirus {
   return $lista
 }
 
+# ---------------------------------------------------------------- inventario detalhado (pecas)
+# Tudo so leitura (WMI/CIM e registro). Cada parte tem o proprio try: uma falha (WMI quebrado, notebook sem bateria,
+# Windows sem TPM) nunca derruba o relatorio; o campo fica vazio e o portal mostra "nao informado".
+
+# SMBIOSMemoryType (padrao SMBIOS 3.x) e o MemoryType antigo, para quem nao preenche o novo.
+$TIPOS_DE_MEMORIA = @{ 20 = 'DDR'; 21 = 'DDR2'; 22 = 'DDR2'; 24 = 'DDR3'; 26 = 'DDR4'; 27 = 'LPDDR'; 28 = 'LPDDR2'; 29 = 'LPDDR3'; 30 = 'LPDDR4'; 34 = 'DDR5'; 35 = 'LPDDR5' }
+$FORMATOS_DE_MEMORIA = @{ 8 = 'DIMM'; 12 = 'SODIMM' }
+
+function Texto-Limpo($Valor) {
+  if ($null -eq $Valor) { return '' }
+  return (([string]$Valor) -replace '[\x00-\x1F]', '').Trim()
+}
+
+# Os campos do WmiMonitorID chegam como lista de numeros (codigos de letra, com zeros no fim).
+function Texto-DoWmi($Codigos) {
+  if (-not $Codigos) { return '' }
+  return Texto-Limpo ((@($Codigos) | Where-Object { $_ -gt 0 } | ForEach-Object { [char][int]$_ }) -join '')
+}
+
+function Tipo-DaMemoria($Smbios, $Antigo) {
+  foreach ($codigo in @($Smbios, $Antigo)) { if ($codigo -and $TIPOS_DE_MEMORIA.ContainsKey([int]$codigo)) { return $TIPOS_DE_MEMORIA[[int]$codigo] } }
+  return ''
+}
+
+function Converter-Pente($M) {
+  return [ordered]@{
+    slot          = Texto-Limpo $M.DeviceLocator
+    tamanhoGB     = if ($M.Capacity) { [math]::Round([double]$M.Capacity / 1GB, 1) } else { $null }
+    tipo          = Tipo-DaMemoria $M.SMBIOSMemoryType $M.MemoryType
+    formato       = if ($M.FormFactor -and $FORMATOS_DE_MEMORIA.ContainsKey([int]$M.FormFactor)) { $FORMATOS_DE_MEMORIA[[int]$M.FormFactor] } else { '' }
+    velocidadeMHz = if ($M.Speed) { [int]$M.Speed } else { $null }
+    emUsoMHz      = if ($M.ConfiguredClockSpeed) { [int]$M.ConfiguredClockSpeed } else { $null }
+    fabricante    = Texto-Limpo $M.Manufacturer
+    codigo        = Texto-Limpo $M.PartNumber
+    serie         = Texto-Limpo $M.SerialNumber
+  }
+}
+
+function Ler-Memoria {
+  $pentes = @(); $slots = $null; $maxGB = $null
+  try { $pentes = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop | ForEach-Object { Converter-Pente $_ }) } catch {}
+  try {
+    # Use = 3: memoria do sistema (exclui cache/flash que algumas placas tambem listam).
+    $bancos = @(Get-CimInstance Win32_PhysicalMemoryArray -ErrorAction Stop | Where-Object { $_.Use -eq 3 -or -not $_.Use })
+    if ($bancos.Count) {
+      $slots = [int](($bancos | Measure-Object -Property MemoryDevices -Sum).Sum)
+      $kb = 0.0
+      foreach ($b in $bancos) { if ($b.MaxCapacityEx) { $kb += [double]$b.MaxCapacityEx } elseif ($b.MaxCapacity) { $kb += [double]$b.MaxCapacity } }
+      if ($kb -gt 0) { $maxGB = [int][math]::Round($kb / 1MB) }
+    }
+  } catch {}
+  return [ordered]@{ slots = $slots; maxGB = $maxGB; pentes = @($pentes) }
+}
+
+# Memoria de video: o AdapterRAM do WMI para em 4 GB; o registro do driver tem o valor certo (qwMemorySize).
+function Ler-PlacasDeVideo {
+  $doRegistro = @{}
+  try {
+    foreach ($chave in @(Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}' -ErrorAction Stop)) {
+      $p = Get-ItemProperty -Path $chave.PSPath -ErrorAction SilentlyContinue
+      if ($p -and $p.DriverDesc -and $p.'HardwareInformation.qwMemorySize') { $doRegistro[[string]$p.DriverDesc] = [double]$p.'HardwareInformation.qwMemorySize' }
+    }
+  } catch {}
+  $placas = @()
+  try {
+    $placas = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | ForEach-Object {
+        $bytes = if ($doRegistro.ContainsKey([string]$_.Name)) { $doRegistro[[string]$_.Name] } elseif ($_.AdapterRAM -gt 0) { [double]$_.AdapterRAM } else { 0 }
+        [ordered]@{
+          nome        = Texto-Limpo $_.Name
+          memoriaMB   = if ($bytes -gt 0) { [int][math]::Round($bytes / 1MB) } else { $null }
+          driver      = Texto-Limpo $_.DriverVersion
+          driverData  = if ($_.DriverDate) { try { ([datetime]$_.DriverDate).ToString('yyyy-MM-dd') } catch { '' } } else { '' }
+        }
+      })
+  } catch {}
+  return @($placas)
+}
+
+function Ler-Monitores {
+  try {
+    return @(Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorID -ErrorAction Stop | ForEach-Object {
+        [ordered]@{
+          fabricante = Texto-DoWmi $_.ManufacturerName
+          modelo     = Texto-DoWmi $_.UserFriendlyName
+          codigo     = Texto-DoWmi $_.ProductCodeID
+          serie      = Texto-DoWmi $_.SerialNumberID
+          ano        = if ($_.YearOfManufacture) { [int]$_.YearOfManufacture } else { $null }
+        }
+      })
+  } catch { return @() }
+}
+
+function Ler-Bateria {
+  $win = $null
+  try { $win = @(Get-CimInstance Win32_Battery -ErrorAction Stop) } catch { return $null }
+  if (-not $win.Count) { return $null }   # computador de mesa: sem bateria
+  $bat = [ordered]@{ projetadaMWh = $null; atualMWh = $null; saudePct = $null; ciclos = $null; cargaPct = $null }
+  try { $bat.cargaPct = [int]($win | Select-Object -First 1).EstimatedChargeRemaining } catch {}
+  try { $bat.projetadaMWh = [int](@(Get-CimInstance -Namespace root/wmi -ClassName BatteryStaticData -ErrorAction Stop)[0].DesignedCapacity) } catch {}
+  try { $bat.atualMWh = [int](@(Get-CimInstance -Namespace root/wmi -ClassName BatteryFullChargedCapacity -ErrorAction Stop)[0].FullChargedCapacity) } catch {}
+  try { $bat.ciclos = [int](@(Get-CimInstance -Namespace root/wmi -ClassName BatteryCycleCount -ErrorAction Stop)[0].CycleCount) } catch {}
+  if ($bat.projetadaMWh -gt 0 -and $bat.atualMWh -gt 0) { $bat.saudePct = [int][math]::Min(100, [math]::Round(100 * $bat.atualMWh / $bat.projetadaMWh)) }
+  return $bat
+}
+
+# TPM e inicializacao segura: o que o Windows 11 exige. Null = nao foi possivel saber (nao e "nao tem").
+function Ler-Seguranca-DoHardware {
+  $r = [ordered]@{ tpm = $null; tpmVersao = ''; secureBoot = $null; uefi = $null }
+  try {
+    $tpm = Get-CimInstance -Namespace root/cimv2/Security/MicrosoftTpm -ClassName Win32_Tpm -ErrorAction Stop
+    if ($tpm) {
+      $r.tpm = ($tpm.IsEnabled_InitialValue -eq $true)
+      $r.tpmVersao = Texto-Limpo (([string]$tpm.SpecVersion) -split ',')[0]
+    } else { $r.tpm = $false }
+  } catch {}
+  try { $r.secureBoot = [bool](Confirm-SecureBootUEFI -ErrorAction Stop); $r.uefi = $true }
+  catch [System.PlatformNotSupportedException] { $r.secureBoot = $false; $r.uefi = $false }
+  catch {}
+  return $r
+}
+
+function Ler-Inventario($Bios, $Placa, $Cpu) {
+  $inv = [ordered]@{}
+  $inv.bios = [ordered]@{
+    fabricante = if ($Bios) { Texto-Limpo $Bios.Manufacturer } else { '' }
+    versao     = if ($Bios) { Texto-Limpo $Bios.SMBIOSBIOSVersion } else { '' }
+    data       = if ($Bios -and $Bios.ReleaseDate) { try { ([datetime]$Bios.ReleaseDate).ToString('yyyy-MM-dd') } catch { '' } } else { '' }
+  }
+  $inv.placaMaeDetalhe = [ordered]@{
+    fabricante = if ($Placa) { Texto-Limpo $Placa.Manufacturer } else { '' }
+    modelo     = if ($Placa) { Texto-Limpo $Placa.Product } else { '' }
+    versao     = if ($Placa) { Texto-Limpo $Placa.Version } else { '' }
+    serie      = if ($Placa) { Texto-Limpo $Placa.SerialNumber } else { '' }
+  }
+  $primeira = $Cpu | Select-Object -First 1
+  $inv.cpuDetalhe = [ordered]@{
+    mhz      = if ($primeira -and $primeira.MaxClockSpeed) { [int]$primeira.MaxClockSpeed } else { $null }
+    soquete  = if ($primeira) { Texto-Limpo $primeira.SocketDesignation } else { '' }
+    soquetes = @($Cpu).Count
+  }
+  $inv.memoria = Ler-Memoria
+  $inv.placasDeVideo = @(Ler-PlacasDeVideo)
+  $inv.monitores = @(Ler-Monitores)
+  $inv.bateria = Ler-Bateria
+  $inv.seguranca = Ler-Seguranca-DoHardware
+  return $inv
+}
+
 function Montar-RelatorioPc($Cfg = $null) {
   # Wi-Fi: so em computador com placa de Wi-Fi ligada.
   $wifi = Ler-Wifi
@@ -384,7 +532,7 @@ function Montar-RelatorioPc($Cfg = $null) {
   } catch {}
   $fisicos = @(); try {
     $fisicos = @(Get-PhysicalDisk -ErrorAction Stop | ForEach-Object {
-        [ordered]@{ modelo = $_.FriendlyName; tipo = if ($_.MediaType -eq 'SSD' -or $_.MediaType -eq 4) { 'SSD' } elseif ($_.MediaType -eq 'HDD' -or $_.MediaType -eq 3) { 'HDD' } else { '' }; tamanhoGB = [int][math]::Round($_.Size / 1GB); saude = [string]$_.HealthStatus }
+        [ordered]@{ modelo = $_.FriendlyName; tipo = if ($_.MediaType -eq 'SSD' -or $_.MediaType -eq 4) { 'SSD' } elseif ($_.MediaType -eq 'HDD' -or $_.MediaType -eq 3) { 'HDD' } else { '' }; tamanhoGB = [int][math]::Round($_.Size / 1GB); saude = [string]$_.HealthStatus; serie = Texto-Limpo $_.SerialNumber; barramento = [string]$_.BusType }
       })
   } catch {}
 
@@ -396,6 +544,9 @@ function Montar-RelatorioPc($Cfg = $null) {
   $dnsOk = Testar-Dns
 
   $ramTotalMB = [int][math]::Round($so.TotalVisibleMemorySize / 1024)
+  # Pecas em detalhe (pentes de memoria, BIOS, monitores, bateria, TPM...): agente 2.9.
+  $inventario = [ordered]@{}
+  try { $inventario = Ler-Inventario $bios $placa $cpu } catch { Escrever-Log "Falha no inventario detalhado: $($_.Exception.Message)" }
   # Diagnostico (desempenho, programas que pesam, eventos do Windows): desliga com "diagnostico": false no config.json.
   $diagnostico = $null
   if ($Cfg -and $Cfg.diagnostico -eq $true) {
@@ -434,6 +585,14 @@ function Montar-RelatorioPc($Cfg = $null) {
         threads    = [int](($cpu | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum)
         ramTotalMB = $ramTotalMB
         gpus       = @($gpus)
+        bios            = $inventario.bios
+        placaMaeDetalhe = $inventario.placaMaeDetalhe
+        cpuDetalhe      = $inventario.cpuDetalhe
+        memoria         = $inventario.memoria
+        placasDeVideo   = @($inventario.placasDeVideo)
+        monitores       = @($inventario.monitores)
+        bateria         = $inventario.bateria
+        seguranca       = $inventario.seguranca
       }
       uso           = [ordered]@{
         cpu        = [int](($cpu | Measure-Object -Property LoadPercentage -Average).Average)
