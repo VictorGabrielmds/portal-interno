@@ -1,0 +1,1 @@
+import{Et as e}from"./index-ZD5OfBku.js";var t=e(`chevron-up`,[[`path`,{d:`m18 15-6-6-6 6`,key:`153udz`}]]);export{t};
